@@ -7,13 +7,13 @@ const crypto = require('crypto');
 const DATA_DIR = path.join(__dirname, 'data');
 const PLAYER_DIR = path.join(DATA_DIR, 'playerdata');
 const CACHE_DIR = path.join(__dirname, 'cache');
+const RESOURCE_DIR = path.join(__dirname, 'resource');
+const LANG_DIR = path.join(__dirname, 'lang');
 
-if (!fs.existsSync(PLAYER_DIR)) {
-  fs.mkdirSync(PLAYER_DIR, { recursive: true });
-}
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
+// 启动时确保必要目录存在
+[DATA_DIR, PLAYER_DIR, CACHE_DIR, RESOURCE_DIR, LANG_DIR].forEach(dir => {
+  fs.mkdirSync(dir, { recursive: true });
+});
 // 生成空进度数据
 function createEmptyProgress(username, deviceId) {
   const now = new Date().toISOString();

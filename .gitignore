@@ -1,8 +1,9 @@
 .idea
 .screenshots
 .trae-html-share-packages
-cache
+cach
 data
+lang
 resource
 runtime.msi
 Readme.txt
