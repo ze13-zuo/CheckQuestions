@@ -1,0 +1,9 @@
+.idea
+.screenshots
+.trae-html-share-packages
+cache
+data
+resource
+runtime.msi
+Readme.txt
+*.url

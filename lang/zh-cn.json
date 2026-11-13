@@ -1,0 +1,244 @@
+{
+  "title": "字谜闯关游戏",
+  "nav": {
+    "xiehouyu": "歇后语字谜",
+    "gushi": "古诗字谜",
+    "caizi": "猜字字谜"
+  },
+  "bank": {
+    "button": "题库",
+    "menuTitle": "切换题库",
+    "currentTag": "当前",
+    "empty": "暂无可选题库",
+    "loadFailed": "切换题库失败：题库文件无法读取"
+  },
+  "bgm": {
+    "next": "下一首"
+  },
+  "buttons": {
+    "about": "关于",
+    "help": "帮助",
+    "settings": "设置",
+    "achievements": "成就",
+    "next": "下一题 ➡️",
+    "complete": "完成",
+    "back": "🏠 返回",
+    "return": "返回游戏",
+    "deleteAccount": "注销用户",
+    "save": "保存",
+    "shop": "商店",
+    "achievements": "成就"
+  },
+  "security": {
+    "password": "登录密码",
+    "twofa": "二步验证 (2FA)",
+    "setPwd": "设置密码",
+    "changePwd": "修改密码",
+    "enable2fa": "开启2FA",
+    "manage2fa": "管理2FA"
+  },
+  "points": {
+    "title": "积分"
+  },
+  "achv": {
+    "title": "成就",
+    "back": "返回",
+    "empty": "这里只有棍木:(",
+    "unnamed": "未命名成就",
+    "globalTitle": "🏆 全局成就",
+    "bankTitle": "📖 本题库成就",
+    "claimTitle": "🎉 成就达成！",
+    "claimDone": "你完成了「{{name}}」成就！",
+    "claimBtn": "领取 {{points}} 积分"
+  },
+  "shop": {
+    "title": "商店",
+    "empty": "卖品也许被妖猫吞了!",
+    "buy": "购买",
+    "buyWithPrice": "购买（{{price}} 积分）",
+    "upgrade": "升级到 Lv.{{level}}（{{price}} 积分）",
+    "upgradeMsg": "确定花费 {{price}} 积分将「{{name}}」升级到 Lv.{{level}} 吗？",
+    "confirmBtnUp": "确认升级",
+    "maxed": "已满级 ✅",
+    "owned": "已拥有",
+    "insufficient": "积分不足",
+    "confirmTitle": "确认购买",
+    "confirmMsg": "确定花费 {{price}} 积分购买「{{name}}」吗？",
+    "confirmBtn": "确认购买",
+    "poorTitle": "积分不足",
+    "poorMsg": "积分不足！购买「{{name}}」需要 {{price}} 积分。",
+    "poorBtn": "知道了"
+  },
+  "game": {
+    "question": "第 {{current}} / {{total}} 题",
+    "promptText": "谜底是？",
+    "correct": "🎉 太棒了！答对啦！",
+    "wrong": "😅 哎呀！答错了，再接再厉！",
+    "timeLeft": "⏱ 剩余 {{s}} 秒",
+    "timeUpTip": "时间到！",
+    "retry": "🔄 再试一次",
+    "backHome": "🏠 返回主页面",
+    "levelComplete": "🎉 第{{level}}关通关！\n━━━━━━━━━━━━━━\n成功率：{{accuracy}}%\n评价：{{prizeIcon}} {{prize}}\n━━━━━━━━━━━━━━",
+    "win": "完美通关！一等奖",
+    "excellent": "优秀！二等奖",
+    "good": "良好！三等奖",
+    "tryAgain": "还需努力",
+    "pointsGained": "💰 获得 {{points}} 积分"
+  },
+  "about": {
+    "title": "游戏说明",
+    "rules": "游戏规则",
+    "rulesContent": [
+      "点击关卡按钮开始对应关卡",
+      "每道题目会显示字谜的前半部分",
+      "从三个选项中选择你认为正确的后半部分",
+      "选择后会立即显示正确与否",
+      "点击\"下一题\"继续答题",
+      "完成所有题目后会显示正确率和评价"
+    ],
+    "feature": "游戏特色",
+    "featureContent": [
+      "题目随机：每次开始关卡时，题目顺序都会随机打乱",
+      "答案随机：部分题目有多个正确答案，每次会随机选择一个",
+      "干扰项随机：干扰选项也会随机变化，增加游戏挑战性",
+      "正确率统计：实时统计并显示答题正确率",
+      "PK模式：支持双人对战，实时竞争答题，增加游戏趣味性"
+    ],
+    "tips": "哈气技巧",
+    "tipsContent": "基米语是哈国传统南北中的南北绿豆，通常由两部分组成：前一部分是哈气，后一部分是狒狒。答南北时可以结合哈基米来思考。",
+    "creator": "制作者：",
+    "tool": "开发工具：",
+    "version": "版本：",
+    "bilibili": "在Bilibili找到我们："
+  },
+  "help": {
+    "title": "游戏帮助",
+    "gameRules": "🎯 游戏规则",
+    "gameRulesContent": [
+      "点击关卡按钮开始对应关卡",
+      "每道题目会显示字谜的前半部分",
+      "从三个选项中选择你认为正确的后半部分",
+      "选择后会立即显示正确与否",
+      "点击\"下一题\"继续答题",
+      "完成所有题目后会显示正确率和评价"
+    ],
+    "tips": "💡 答题技巧",
+    "tipsContent": [
+      "字谜通常由比喻和解释两部分组成",
+      "注意谐音和双关语的使用",
+      "结合生活常识和文化背景",
+      "如果不确定，可以尝试排除法"
+    ],
+    "rewards": "🏆 奖励等级",
+    "rewardsContent": [
+      "100%正确率：一等奖 🏆",
+      "80%-99%正确率：二等奖 🥈",
+      "60%-79%正确率：三等奖 🥉",
+      "低于60%：未获奖 💪"
+    ],
+    "note": "提示：",
+    "noteContent": "多玩几次可以提高正确率哦！"
+  },
+  "settings": {
+    "title": "游戏设置",
+    "gameSettings": "🎮 游戏设置",
+    "progress": "📊 进度管理",
+    "sound": "音效",
+    "music": "背景音乐",
+    "bgmVolume": "音乐音量",
+    "float": "浮动动画",
+    "language": "语言",
+    "security": "🔐 账号安全",
+    "note": "提示：设置会自动保存"
+  },
+  "categories": {
+    "xiehouyu": "歇后语字谜",
+    "gushi": "古诗字谜",
+    "caizi": "猜字字谜"
+  },
+  "level": "第{{level}}关",
+  "prize": {
+    "first": "一等奖",
+    "second": "二等奖",
+    "third": "三等奖",
+    "none": "未获奖"
+  },
+  "confirm": {
+    "deleteAccount": "确定要注销当前用户吗？所有游戏数据将被删除且不可恢复！",
+    "deleteAccountReconfirm": "再次确认：注销后无法恢复，确定继续吗？"
+  },
+  "alert": {
+    "accountDeleted": "用户已注销，请重新登录",
+    "deleteFailed": "注销用户失败！"
+  },
+  "pk": {
+    "mode": "PK模式",
+    "player1": "玩家1",
+    "player2": "玩家2",
+    "start": "开始游戏",
+    "prepare": "准备开始",
+    "time": "剩余时间：",
+    "win": "胜利！",
+    "tryAgain": "再接再厉",
+    "draw": "平局",
+    "winMsg": "你真是字谜达人！",
+    "tryAgainMsg": "再接再厉！",
+    "drawMsg": "旗鼓相当！",
+    "score": "分数: {{score}}",
+    "return": "返回主页面",
+    "matchTitle": "匹配队列",
+    "matchSearching": "正在匹配对手",
+    "matchWaiting": "等待对手加入...",
+    "matchHint": "请在另一台设备上打开本页面，进入PK模式并点击开始游戏，即可自动匹配",
+    "matchCancelBtn": "取消匹配",
+    "matchSuccess": "匹配成功！",
+    "matchStartIn": "{{s}} 秒后开始",
+    "matchNeedLogin": "请先登录后再匹配",
+    "matchServerError": "匹配服务不可用，请确认服务器已启动",
+    "selfDone": "已完成所有题目，等待对方...",
+    "timeUp": "时间到！等待对方完成...",
+    "opponentAnswering": "对方答题中...",
+    "opponentDone": "对方已完成！",
+    "opponentLeft": "对方已退出对战",
+    "bankSelectTitle": "双方题库不一致",
+    "bankSelectPrompt": "你当前使用《{{my}}》，对手使用《{{opponent}}》。双方题目不同，请各选择一个相同的题库开始PK；若选择不一致，PK将终止。",
+    "bankSelectWaiting": "已提交选择，等待对手选择...",
+    "bankSelectMismatch": "双方选择的题库不一致，PK终止",
+    "bankSelectOpponentLeft": "对方已退出，题库协商终止",
+    "bankLoadFailed": "所选题库加载失败，PK终止",
+    "moreWays": "更多联机方式",
+    "beHost": "我想当房主",
+    "beGuest": "我想当房客",
+    "p2pCodeLabel": "联机码",
+    "p2pWaitingGuest": "等待房客加入...",
+    "p2pCodeHint": "请将联机码告知对方，对方选择「我想当房客」并输入此码即可配对",
+    "p2pEnterCode": "输入邀请码",
+    "p2pJoinBtn": "确认加入",
+    "p2pCodeInvalid": "联机码无效",
+    "p2pDirectOn": "直连已建立",
+    "p2pDirectOff": "服务器中转"
+  },
+  "auth": {
+    "welcome": "欢迎来到字谜闯关游戏",
+    "subtitle": "首次进入请输入用户名，系统将自动为你创建角色",
+    "placeholder": "请输入用户名（1-20位中英文、数字或下划线）",
+    "enter": "进入游戏",
+    "emptyError": "用户名不能为空",
+    "invalidError": "用户名只能包含1-20位中英文、数字或下划线",
+    "loadError": "登录失败，请重试",
+    "deviceMismatch": "检测到设备变更，请输入用户名手动登录",
+    "switch": "切换账号",
+    "logout": "退出登录"
+  },
+  "easterEgg": {
+    "title": "🎉 恭喜你发现了彩蛋！",
+    "message": "你是一个细心的玩家！\n\n继续享受游戏吧！",
+    "close": "关闭"
+  },
+  "vip": {
+    "title": "👑 VIP 专属特权",
+    "desc": "点击下方获得vip特权",
+    "get": "点我获取",
+    "close": "关闭"
+  }
+}

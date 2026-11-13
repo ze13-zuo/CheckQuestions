@@ -1,0 +1,61 @@
+{
+  "auth": {
+    "welcome": "Welcome to Programming Knowledge Quiz",
+    "subtitle": "Enter a username to create your character on first visit"
+  },
+  "pk": {
+    "winMsg": "You are a coding whiz!"
+  },
+  "about": {
+    "title": "Game Instructions",
+    "rules": "Game Rules",
+    "rulesContent": [
+      "Click on the level button to start the corresponding level",
+      "Each question presents a programming-related problem",
+      "Choose the correct answer from the options",
+      "You will immediately see if your answer is correct",
+      "Click \"Next\" to continue answering",
+      "After completing all questions, your accuracy and rating will be displayed"
+    ],
+    "feature": "Game Features",
+    "featureContent": [
+      "Random Questions: The order of questions is randomly shuffled each time you start a level",
+      "Random Answers: Some questions have multiple correct answers, and one is randomly selected each time",
+      "Random Distractors: Distractor options also change randomly, increasing game challenge",
+      "Accuracy Statistics: Real-time statistics and display of answer accuracy",
+      "PK Mode: Supports two-player battle, real-time competitive answering, increasing game fun"
+    ],
+    "creator": "Creators: ",
+    "tool": "Development Tool: ",
+    "version": "Version: ",
+    "bilibili": "Find us on Bilibili:"
+  },
+  "help": {
+    "title": "Game Help",
+    "gameRules": "🎯 Game Rules",
+    "gameRulesContent": [
+      "Click on the level button to start the corresponding level",
+      "Each question presents a programming-related problem",
+      "Choose the correct answer from the options",
+      "You will immediately see if your answer is correct",
+      "Click \"Next\" to continue answering",
+      "After completing all questions, your accuracy and rating will be displayed"
+    ],
+    "tips": "💡 Answering Tips",
+    "tipsContent": [
+      "Pay attention to syntax differences across languages (Python, C++, Scratch)",
+      "Distinguish keywords, function names, and data types",
+      "Watch for details like comment symbols and file extensions",
+      "If you're unsure, try the elimination method"
+    ],
+    "rewards": "🏆 Reward Levels",
+    "rewardsContent": [
+      "100% accuracy: First Prize 🏆",
+      "80%-99% accuracy: Second Prize 🥈",
+      "60%-79% accuracy: Third Prize 🥉",
+      "Below 60%: No Prize 💪"
+    ],
+    "note": "Note:",
+    "noteContent": "Programming more and practicing can improve your accuracy!"
+  }
+}

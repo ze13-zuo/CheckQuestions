@@ -1,0 +1,244 @@
+{
+  "title": "Riddle Challenge Game",
+  "nav": {
+    "xiehouyu": "Xiehouyu Riddles",
+    "gushi": "Ancient Poetry Riddles",
+    "caizi": "Character Riddles"
+  },
+  "bank": {
+    "button": "Banks",
+    "menuTitle": "Switch Question Bank",
+    "currentTag": "Current",
+    "empty": "No question banks available",
+    "loadFailed": "Failed to switch bank: cannot read bank file"
+  },
+  "bgm": {
+    "next": "Next"
+  },
+  "buttons": {
+    "about": "About",
+    "help": "Help",
+    "settings": "Settings",
+    "achievements": "Achievements",
+    "next": "Next ➡️",
+    "complete": "Complete",
+    "back": "🏠 Back",
+    "return": "Return to Game",
+    "deleteAccount": "Delete Account",
+    "save": "Save",
+    "shop": "Shop",
+    "achievements": "Achievements"
+  },
+  "security": {
+    "password": "Login Password",
+    "twofa": "Two-Factor Auth (2FA)",
+    "setPwd": "Set Password",
+    "changePwd": "Change Password",
+    "enable2fa": "Enable 2FA",
+    "manage2fa": "Manage 2FA"
+  },
+  "points": {
+    "title": "Points"
+  },
+  "achv": {
+    "title": "Achievements",
+    "back": "Back",
+    "empty": "Nothing here but a stick :(",
+    "unnamed": "Unnamed Achievement",
+    "globalTitle": "🏆 Global Achievements",
+    "bankTitle": "📖 Bank Achievements",
+    "claimTitle": "🎉 Achievement Unlocked!",
+    "claimDone": "You completed the \"{{name}}\" achievement!",
+    "claimBtn": "Claim {{points}} Points"
+  },
+  "shop": {
+    "title": "Shop",
+    "empty": "The goods may have been eaten by the demon cat!",
+    "buy": "Buy",
+    "buyWithPrice": "Buy ({{price}} points)",
+    "upgrade": "Upgrade to Lv.{{level}} ({{price}} points)",
+    "upgradeMsg": "Spend {{price}} points to upgrade \"{{name}}\" to Lv.{{level}}?",
+    "confirmBtnUp": "Confirm Upgrade",
+    "maxed": "Max Level ✅",
+    "owned": "Owned",
+    "insufficient": "Not enough points",
+    "confirmTitle": "Confirm Purchase",
+    "confirmMsg": "Spend {{price}} points to buy \"{{name}}\"?",
+    "confirmBtn": "Confirm",
+    "poorTitle": "Not Enough Points",
+    "poorMsg": "Not enough points! Buying \"{{name}}\" requires {{price}} points.",
+    "poorBtn": "OK"
+  },
+  "game": {
+    "question": "Question {{current}} / {{total}}",
+    "promptText": "Answer:",
+    "correct": "🎉 Great! You got it right!",
+    "wrong": "😅 Oops! Wrong answer, keep trying!",
+    "timeLeft": "⏱ {{s}}s left",
+    "timeUpTip": "Time's up!",
+    "retry": "🔄 Try Again",
+    "backHome": "🏠 Return to Main Page",
+    "levelComplete": "🎉 Level {{level}} Completed!\n━━━━━━━━━━━━━━\nAccuracy: {{accuracy}}%\nRating: {{prizeIcon}} {{prize}}\n━━━━━━━━━━━━━━",
+    "win": "Perfect! First Prize",
+    "excellent": "Excellent! Second Prize",
+    "good": "Good! Third Prize",
+    "tryAgain": "Need more practice",
+    "pointsGained": "💰 Earned {{points}} points"
+  },
+  "about": {
+    "title": "Game Instructions",
+    "rules": "Game Rules",
+    "rulesContent": [
+      "Click on the level button to start the corresponding level",
+      "Each question will display the first part of the riddle",
+      "Choose the correct second part from three options",
+      "You will immediately see if your answer is correct",
+      "Click \"Next\" to continue answering",
+      "After completing all questions, your accuracy and rating will be displayed"
+    ],
+    "feature": "Game Features",
+    "featureContent": [
+      "Random Questions: The order of questions is randomly shuffled each time you start a level",
+      "Random Answers: Some questions have multiple correct answers, and one is randomly selected each time",
+      "Random Distractors: Distractor options also change randomly, increasing game challenge",
+      "Accuracy Statistics: Real-time statistics and display of answer accuracy",
+      "PK Mode: Supports two-player battle, real-time competitive answering, increasing game fun"
+    ],
+    "tips": "Haqi Tips",
+    "tipsContent": "Jimi language is a traditional Nanbei Lvdou in Hagu, usually consisting of two parts: the first part is the Haqi, and the second part is the baboon. You can think about it in combination with Hajimi when answering Nanbei questions.",
+    "creator": "Creators: ",
+    "tool": "Development Tool: ",
+    "version": "Version: ",
+    "bilibili": "Find us on Bilibili:"
+  },
+  "help": {
+    "title": "Game Help",
+    "gameRules": "🎯 Game Rules",
+    "gameRulesContent": [
+      "Click on the level button to start the corresponding level",
+      "Each question will display the first part of the riddle",
+      "Choose the correct second part from three options",
+      "You will immediately see if your answer is correct",
+      "Click \"Next\" to continue answering",
+      "After completing all questions, your accuracy and rating will be displayed"
+    ],
+    "tips": "💡 Answering Tips",
+    "tipsContent": [
+      "Riddles usually consist of two parts: metaphor and explanation",
+      "Pay attention to homophones and puns",
+      "Combine common sense and cultural background",
+      "If you're unsure, try the elimination method"
+    ],
+    "rewards": "🏆 Reward Levels",
+    "rewardsContent": [
+      "100% accuracy: First Prize 🏆",
+      "80%-99% accuracy: Second Prize 🥈",
+      "60%-79% accuracy: Third Prize 🥉",
+      "Below 60%: No Prize 💪"
+    ],
+    "note": "Note:",
+    "noteContent": "Playing more times can improve your accuracy!"
+  },
+  "settings": {
+    "title": "Game Settings",
+    "gameSettings": "🎮 Game Settings",
+    "progress": "📊 Progress Management",
+    "sound": "Sound",
+    "music": "Background Music",
+    "bgmVolume": "Music Volume",
+    "float": "Floating Animations",
+    "language": "Language",
+    "security": "🔐 Account Security",
+    "note": "Note: Settings will be saved automatically"
+  },
+  "categories": {
+    "xiehouyu": "Xiehouyu Riddles",
+    "gushi": "Ancient Poetry Riddles",
+    "caizi": "Character Riddles"
+  },
+  "level": "Level {{level}}",
+  "prize": {
+    "first": "First Prize",
+    "second": "Second Prize",
+    "third": "Third Prize",
+    "none": "No Prize"
+  },
+  "confirm": {
+    "deleteAccount": "Are you sure you want to delete this account? All game data will be permanently deleted!",
+    "deleteAccountReconfirm": "Confirm again: This cannot be undone. Are you sure?"
+  },
+  "alert": {
+    "accountDeleted": "Account deleted. Please log in again.",
+    "deleteFailed": "Failed to delete account!"
+  },
+  "pk": {
+    "mode": "PK Mode",
+    "player1": "Player 1",
+    "player2": "Player 2",
+    "start": "Start Game",
+    "prepare": "Ready to start",
+    "time": "Time left: ",
+    "win": "Victory!",
+    "tryAgain": "Keep trying",
+    "draw": "Draw",
+    "winMsg": "You are a riddle master!",
+    "tryAgainMsg": "Keep trying!",
+    "drawMsg": "Evenly matched!",
+    "score": "Score: {{score}}",
+    "return": "Return to Main Page",
+    "matchTitle": "Match Queue",
+    "matchSearching": "Searching for an opponent",
+    "matchWaiting": "Waiting for opponent...",
+    "matchHint": "Open this page on another device, enter PK mode and click Start Game to match automatically",
+    "matchCancelBtn": "Cancel Match",
+    "matchSuccess": "Match found!",
+    "matchStartIn": "Starting in {{s}}s",
+    "matchNeedLogin": "Please log in before matching",
+    "matchServerError": "Match service unavailable. Please make sure the server is running",
+    "selfDone": "All questions done, waiting for opponent...",
+    "timeUp": "Time's up! Waiting for opponent...",
+    "opponentAnswering": "Opponent is answering...",
+    "opponentDone": "Opponent finished!",
+    "opponentLeft": "Opponent has left the battle",
+    "bankSelectTitle": "Question Banks Differ",
+    "bankSelectPrompt": "You are using \"{{my}}\" while your opponent uses \"{{opponent}}\". Please both choose the same question bank to start; if your choices differ, the PK will be cancelled.",
+    "bankSelectWaiting": "Choice submitted, waiting for opponent...",
+    "bankSelectMismatch": "The two chosen question banks differ. PK cancelled.",
+    "bankSelectOpponentLeft": "Your opponent has left; bank negotiation cancelled.",
+    "bankLoadFailed": "Failed to load the chosen question bank. PK cancelled.",
+    "moreWays": "More Ways to Connect",
+    "beHost": "Host a Game",
+    "beGuest": "Join as Guest",
+    "p2pCodeLabel": "Room Code",
+    "p2pWaitingGuest": "Waiting for the guest to join...",
+    "p2pCodeHint": "Share this code with your opponent. They pick \"Join as Guest\" and enter it to pair up.",
+    "p2pEnterCode": "Enter Invite Code",
+    "p2pJoinBtn": "Join",
+    "p2pCodeInvalid": "Invalid room code",
+    "p2pDirectOn": "Direct P2P connected",
+    "p2pDirectOff": "Server relayed"
+  },
+  "auth": {
+    "welcome": "Welcome to the Riddle Challenge Game",
+    "subtitle": "Enter a username to create your character on first visit",
+    "placeholder": "Username (1-20 Chinese/English letters, digits or underscore)",
+    "enter": "Enter Game",
+    "emptyError": "Username cannot be empty",
+    "invalidError": "Username must be 1-20 Chinese/English letters, digits or underscore",
+    "loadError": "Login failed, please try again",
+    "deviceMismatch": "Device change detected. Please enter your username to sign in manually",
+    "switch": "Switch Account",
+    "logout": "Log Out"
+  },
+  "easterEgg": {
+    "title": "🎉 Congratulations on finding the easter egg!",
+    "message": "You are a careful player!\n\nKeep enjoying the game!",
+    "close": "Close"
+  },
+  "vip": {
+    "title": "👑 VIP Exclusive Privileges",
+    "desc": "Click below to get VIP privileges",
+    "get": "Get it here",
+    "close": "Close"
+  }
+}

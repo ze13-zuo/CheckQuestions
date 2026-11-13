@@ -1,0 +1,4824 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>字谜闯关游戏V1.6-beta1</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<script>// ============ 自定义题库系统 ============
+const BANK_ID_STORAGE = 'czm_currentBank';
+const BANK_CACHE_PREFIX = 'czm_bank_cache_';   // localStorage 缓存键前缀：czm_bank_cache_{id}
+const BANK_LIST_CACHE = 'czm_banklist_cache';    // 题库列表缓存
+const BGM_DIR_CACHE_PREFIX = 'czm_bgmlist_';     // BGM目录列表缓存前缀
+const BANK_CACHE_MAX_AGE = 10 * 60 * 1000;       // 缓存有效期10分钟（过期后仍用但后台刷新）
+let bankList = [];          // 服务器返回的可选题库列表
+let currentBank = null;     // 当前题库完整JSON数据
+let currentBankId = null;   // 当前题库ID
+let bankPages = [];         // 当前题库的标签页 [{key,name,type,icon,levels}]
+let pageProgressMap = {};   // 当前题库各标签页通关进度 {key: [每关奖励等级]}
+let playerPoints = 0;       // 玩家积分（保存在玩家数据 points 字段，首次通关获奖才有积分）
+let currentPageKey = null;  // 当前所在标签页key
+let bankDataCache = {};     // 内存题库数据缓存 {id: {ts, data}}
+// ============ 服务器缓存读写（存于 /cache 目录） ============
+let jsonWorker = null;
+const jsonWorkerPending = new Map();
+let jsonWorkerSeq = 0;
+function getJsonWorker() {
+  if (jsonWorker) return jsonWorker;
+  const src = 'self.onmessage=e=>{const{url,id}=e.data;' +
+    'fetch(url).then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json()})' +
+    '.then(d=>self.postMessage({id,ok:true,data:d}))' +
+    '.catch(err=>self.postMessage({id,ok:false,error:String(err&&err.message||err)}))};';
+  jsonWorker = new Worker(URL.createObjectURL(new Blob([src], { type: 'application/javascript' })));
+  jsonWorker.addEventListener('message', e => {
+    const p = jsonWorkerPending.get(e.data.id);
+    if (!p) return;
+    jsonWorkerPending.delete(e.data.id);
+    if (e.data.ok) p.resolve(e.data.data); else p.reject(new Error(e.data.error));
+  });
+  jsonWorker.addEventListener('error', e => {
+    jsonWorkerPending.forEach(p => p.reject(new Error('worker error')));
+    jsonWorkerPending.clear();
+    jsonWorker = null;
+  });
+  return jsonWorker;
+}
+// 在 Worker 线程中请求并解析 JSON（Worker 不可用时回退主线程）
+function fetchJsonInWorker(url) {
+  return new Promise((resolve, reject) => {
+    let w = null;
+    try { w = getJsonWorker(); } catch (e) { w = null; }
+    if (!w) {
+      fetch(url).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }).then(resolve).catch(reject);
+      return;
+    }
+    const id = ++jsonWorkerSeq;
+    jsonWorkerPending.set(id, { resolve, reject });
+    w.postMessage({ url: new URL(url, location.href).href, id });
+  });
+}
+// 从服务器读取缓存，返回 {ts, data} 或 null
+async function getServerCache(key) {
+  try {
+    const j = await fetchJsonInWorker('/api/cache/' + encodeURIComponent(key));
+    return (j && j.success && j.data) ? j.data : null;
+  } catch (e) { return null; }
+}
+// 写入服务器缓存
+function setServerCache(key, data) {
+  fetch('/api/cache/' + encodeURIComponent(key), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  }).then(r => { if (!r.ok) console.warn('缓存写入失败:', key, r.status); })
+    .catch(e => console.warn('缓存写入异常:', key, e));
+}
+// 当前登录玩家
+let currentPlayer = null;
+let currentPlayerHasPassword = false;
+let currentPlayerHas2fa = false;
+// 题库未自定义logo时显示的默认吉祥物SVG
+const DEFAULT_MASCOT_SVG = `<svg viewBox="0 0 100 100">
+    <ellipse cx="50" cy="50" rx="30" ry="38" fill="#DC143C"/>
+    <rect x="40" y="8" width="20" height="8" fill="#FFD700" rx="2"/>
+    <rect x="35" y="88" width="30" height="6" fill="#FFD700" rx="2"/>
+    <line x1="50" y1="94" x2="50" y2="100" stroke="#FFD700" stroke-width="2"/>
+    <circle cx="50" cy="50" r="12" fill="#FFD700"/>
+    <circle cx="50" cy="50" r="6" fill="#DC143C"/>
+    <line x1="38" y1="35" x2="62" y2="35" stroke="#FFD700" stroke-width="2"/>
+    <line x1="38" y1="50" x2="62" y2="50" stroke="#FFD700" stroke-width="2"/>
+    <line x1="38" y1="65" x2="62" y2="65" stroke="#FFD700" stroke-width="2"/>
+  </svg>`;
+// 题库ID校验（与服务器一致：英文、数字、下划线、短横线）
+function isValidBankId(id) {
+  return typeof id === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(id);
+}
+// 标签页key转为可安全用于DOM id 的形式
+function safeDomKey(key) {
+  return String(key).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+// 解析题库JSON为统一的标签页结构
+function normalizeBankPages(data) {
+  const typeIcon = function (t) {
+    return t === 'xiehouyu' ? '❓' : (t === 'gushi' ? '📜' : '🔍');
+  };
+  let defs = [];
+  if (Array.isArray(data.pages)) {
+    defs = data.pages.map(function (p, i) {
+      if (typeof p === 'string') return { key: 'page' + i, name: p, type: 'caizi' };
+      return p || {};
+    });
+  } else {
+    if (Array.isArray(data.levels)) defs.push({ key: 'xiehouyu', name: '歇后语字谜', type: 'xiehouyu', _legacy: data.levels });
+    if (Array.isArray(data.gushiLevels)) defs.push({ key: 'gushi', name: '古诗字谜', type: 'gushi', _legacy: data.gushiLevels });
+    if (Array.isArray(data.caiziLevels)) defs.push({ key: 'caizi', name: '猜字字谜', type: 'caizi', _legacy: data.caiziLevels });
+  }
+  const used = {};
+  return defs.map(function (p, i) {
+    let key = safeDomKey(p.key || ('page' + i));
+    if (used[key]) key = key + '_' + i;
+    used[key] = true;
+    const type = ['xiehouyu', 'gushi', 'caizi'].indexOf(p.type) >= 0 ? p.type : 'caizi';
+    let lv = p._legacy;
+    if (!lv) {
+      if (Array.isArray(data.levels)) lv = data.levels[i];
+      else if (data.levels && typeof data.levels === 'object') lv = data.levels[p.key] || data.levels[key];
+    }
+    return {
+      key: key,
+      name: p.name || key,
+      type: type,
+      icon: p.icon || typeIcon(type),
+      levels: Array.isArray(lv) ? lv : []
+    };
+  });
+}
+// 加载题库列表（扫描服务器 data 目录），并载入上次选择的题库
+async function loadBanks() {
+  // 从服务器缓存读取题库列表（cache 目录）
+  const cached = await getServerCache(BANK_LIST_CACHE);
+  if (cached && Array.isArray(cached.banks) && cached.banks.length) {
+    bankList = cached.banks;
+    fetchJsonInWorker('/api/banks').then(j => {
+      if (j && Array.isArray(j.banks)) {
+        bankList = j.banks;
+        setServerCache(BANK_LIST_CACHE, { banks: bankList, ts: Date.now() });
+        renderBankMenu();
+      }
+    }).catch(e => console.error('获取题库列表失败:', e));
+  } else {
+    try {
+      const j = await fetchJsonInWorker('/api/banks');
+      if (j && Array.isArray(j.banks)) {
+        bankList = j.banks;
+        setServerCache(BANK_LIST_CACHE, { banks: bankList, ts: Date.now() });
+      }
+    } catch (e) { console.error('获取题库列表失败:', e); }
+  }
+  let id = localStorage.getItem(BANK_ID_STORAGE);
+  if (!bankList.some(b => b.id === id)) {
+    id = bankList.some(b => b.id === 'default') ? 'default' : (bankList[0] ? bankList[0].id : null);
+  }
+  if (id) await selectBank(id, true);
+}
+// 载入指定题库并渲染界面（优先内存缓存 -> 服务器缓存，后台静默刷新）
+async function selectBank(id, remember) {
+  const cacheKey = BANK_CACHE_PREFIX + id;
+  // 1) 尝试内存缓存（最快，同步）
+  let cached = bankDataCache[id];
+  if (!cached) {
+    const sc = await getServerCache(cacheKey);
+    if (sc && sc.data) {
+      cached = { ts: sc.ts || 0, data: sc.data };
+      bankDataCache[id] = cached;
+    }
+  }
+  if (cached && cached.data) {
+    applyBankData(cached.data, id, remember);
+    // 后台静默刷新（过期或无版本时强制刷新）
+    const stale = !cached.ts || (Date.now() - cached.ts) > BANK_CACHE_MAX_AGE;
+    fetchBankData(id).then(fresh => {
+      if (fresh) {
+        bankDataCache[id] = { ts: Date.now(), data: fresh };
+        writeBankCache(cacheKey, fresh);
+        if (id === currentBankId) {
+          currentBank = fresh;
+          bankPages = normalizeBankPages(fresh);
+        }
+      }
+    }).catch(() => {});
+    return true;
+  }
+  // 3) 无缓存，直接请求原始数据并写入两级缓存
+  const data = await fetchBankData(id);
+  if (!data) return false;
+  bankDataCache[id] = { ts: Date.now(), data };
+  await writeBankCache(cacheKey, data);
+  applyBankData(data, id, remember);
+  return true;
+}
+// 写入题库数据到服务器缓存（带重试，确保落盘）
+async function writeBankCache(key, data) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch('/api/cache/' + encodeURIComponent(key), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ts: Date.now(), data })
+      });
+      if (r.ok) return;
+    } catch (e) { /* 重试 */ }
+  }
+}
+// 实际请求题库 JSON（fetch与解析在Worker线程完成，不阻塞主线程）
+async function fetchBankData(id) {
+  try {
+    return await fetchJsonInWorker('/data/' + id + '.json');
+  } catch (e) {
+    console.error('加载题库失败:', id, e);
+    return null;
+  }
+}
+// 将题库数据应用到全局变量并渲染
+function applyBankData(data, id, remember) {
+  currentBank = data;
+  currentBankId = isValidBankId(data.id) ? data.id : id;
+  bankPages = normalizeBankPages(data);
+  pageProgressMap = {};
+  bankPages.forEach(p => {
+    pageProgressMap[p.key] = new Array(p.levels.length).fill(null);
+  });
+  if (remember) localStorage.setItem(BANK_ID_STORAGE, currentBankId);
+  renderBankChrome();
+  loadLanguage();
+}
+// 切换题库：保存当前题库进度 -> 载入新题库 -> 加载对应进度
+async function switchBank(id) {
+  if (!id || id === currentBankId) return;
+  document.getElementById('bankMenu').classList.add('hide');
+  if (currentPlayer) {
+    try { await saveProgressAsync(); } catch (e) { /* 忽略保存失败 */ }
+  }
+  const ok = await selectBank(id, true);
+  if (!ok) {
+    alert(langData?.bank?.loadFailed || '切换题库失败：题库文件无法读取');
+    return;
+  }
+  if (currentPlayer) {
+    await loadProgress();
+  } else {
+    showCategory(firstPageKey());
+  }
+}
+// 渲染整套题库外观：logo、标题、背景、导航标签、标签页容器、切换菜单
+function renderBankChrome() {
+  renderBankLogo();
+  const title = currentBank.title || currentBank.name || currentBankId;
+  const titleEl = document.getElementById('gameTitle');
+  if (titleEl) titleEl.textContent = title;
+  applyBankTheme();
+  renderBankBackground();
+  loadBankBgm();
+  renderBankNav();
+  renderBankPages();
+  renderBankMenu();
+}
+// 应用题库主题色与文字颜色到 CSS 变量
+function applyBankTheme() {
+  const theme = (currentBank && currentBank.themeColor) || '#DC143C';
+  const text = (currentBank && currentBank.textColor) || '#FFD700';
+  const root = document.documentElement;
+  root.style.setProperty('--bank-theme', theme);
+  root.style.setProperty('--bank-text', text);
+  root.style.setProperty('--bank-theme-light', lightenColor(theme, 0.25));
+}
+// 将十六进制颜色按比例提亮（amount 0~1），返回十六进制字符串
+function lightenColor(hex, amount) {
+  const c = parseColor(hex);
+  if (!c) return hex;
+  const r = Math.round(c.r + (255 - c.r) * amount);
+  const g = Math.round(c.g + (255 - c.g) * amount);
+  const b = Math.round(c.b + (255 - c.b) * amount);
+  return '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+}
+// 解析颜色为 {r,g,b}，支持 #rgb / #rrggbb / rgb()
+function parseColor(color) {
+  if (!color) return null;
+  color = color.trim();
+  if (color.startsWith('#')) {
+    let h = color.slice(1);
+    if (h.length === 3) h = h.split('').map(c => c + c).join('');
+    if (h.length === 6) {
+      return { r: parseInt(h.slice(0, 2), 16), g: parseInt(h.slice(2, 4), 16), b: parseInt(h.slice(4, 6), 16) };
+    }
+  }
+  const m = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (m) return { r: +m[1], g: +m[2], b: +m[3] };
+  return null;
+}
+// 渲染标题上方logo（图片路径或emoji文字，留空显示默认吉祥物）
+function renderBankLogo() {
+  const box = document.getElementById('mascotBox');
+  if (!box) return;
+  const logo = currentBank.logo;
+  box.innerHTML = '';
+  if (logo && /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i.test(logo.split(/[?#]/)[0])) {
+    const img = document.createElement('img');
+    img.src = logo;
+    img.alt = 'logo';
+    img.style.height = '60px';
+    img.style.filter = 'drop-shadow(0 4px 8px rgba(0,0,0,0.2))';
+    img.onerror = function () { box.innerHTML = DEFAULT_MASCOT_SVG; };
+    box.appendChild(img);
+  } else if (logo) {
+    const span = document.createElement('div');
+    span.textContent = logo;
+    span.style.fontSize = '48px';
+    span.style.lineHeight = '1';
+    span.style.animation = 'float 3s ease-in-out infinite';
+    span.style.filter = 'drop-shadow(0 4px 8px rgba(0,0,0,0.2))';
+    box.appendChild(span);
+  } else {
+    box.innerHTML = DEFAULT_MASCOT_SVG;
+  }
+}
+// 背景预加载竞态标记：快速切换题库时，过期的加载结果不得再写入背景
+let bankBgToken = 0;
+// 判断地址是否为图片（图片走 body 背景，其余网络地址视为网页走 iframe）
+function isImageSrc(src) {
+  const s = String(src).split(/[?#]/)[0];
+  return /^data:image\//i.test(src) || /\.(png|jpe?g|gif|svg|webp|bmp|avif|ico)$/i.test(s);
+}
+// 解析题库 background 配置
+function normalizeBankBackground(cfg) {
+  if (!cfg) return null;
+  if (typeof cfg === 'string') {
+    const src = cfg.trim();
+    if (!src) return null;
+    const webpage = /^https?:\/\//i.test(src) && !isImageSrc(src);
+    return { src, kind: webpage ? 'webpage' : 'image', mode: 'cover', overlay: 0 };
+  }
+  if (typeof cfg === 'object') {
+    const src = String(cfg.src || cfg.url || cfg.image || '').trim();
+    if (!src) return null;
+    // type/mode 指定 webpage 即嵌入整个网页；否则按是否图片地址自动判断
+    const webpage = cfg.type === 'webpage' || cfg.mode === 'webpage' ||
+      ((cfg.type !== 'image') && /^https?:\/\//i.test(src) && !isImageSrc(src));
+    const modes = ['cover', 'contain', 'tile', 'center'];
+    const mode = modes.indexOf(cfg.mode) >= 0 ? cfg.mode : 'cover';
+    let overlay = Number(cfg.overlay);
+    if (!isFinite(overlay) || overlay < 0) overlay = 0;
+    if (overlay > 1) overlay = Math.min(1, overlay / 100); // 兼容 0~100 的写法
+    return { src, kind: webpage ? 'webpage' : 'image', mode, overlay: Math.min(0.95, overlay) };
+  }
+  return null;
+}
+// 网页背景层：全屏 iframe 固定在所有游戏内容之下，不拦截点击
+function getBankWebLayer() {
+  let layer = document.getElementById('bankWebBgLayer');
+  if (layer) return layer;
+  layer = document.createElement('div');
+  layer.id = 'bankWebBgLayer';
+  layer.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;z-index:-1;overflow:hidden;display:none;background:#111;';
+  const frame = document.createElement('iframe');
+  frame.id = 'bankWebBgFrame';
+  frame.setAttribute('tabindex', '-1');
+  frame.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;margin:0;padding:0;pointer-events:none;';
+  const shade = document.createElement('div');
+  shade.id = 'bankWebBgShade';
+  shade.style.cssText = 'position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;';
+  layer.appendChild(frame);
+  layer.appendChild(shade);
+  document.body.insertBefore(layer, document.body.firstChild);
+  return layer;
+}
+// 显示网页背景层（src 未变化时不重新加载）
+function showBankWebBackground(conf) {
+  const layer = getBankWebLayer();
+  const frame = document.getElementById('bankWebBgFrame');
+  const shade = document.getElementById('bankWebBgShade');
+  if (frame && frame.dataset.src !== conf.src) {
+    frame.dataset.src = conf.src;
+    frame.src = conf.src;
+  }
+  if (shade) shade.style.opacity = String(conf.overlay || 0);
+  layer.style.display = 'block';
+  if (!document.getElementById('bgInteractBtn')) {
+    const btn = document.createElement('button');
+    btn.id = 'bgInteractBtn';
+    btn.textContent = '🖐';
+    btn.title = '拖动背景网页';
+    btn.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:10000;width:44px;height:44px;border-radius:50%;border:2px solid rgba(255,255,255,0.5);background:rgba(0,0,0,0.6);color:#fff;font-size:20px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s ease;';
+    btn.onclick = function(e) { e.stopPropagation(); toggleBgInteract(); };
+    document.body.appendChild(btn);
+  }
+}
+
+function hideBankWebBackground() {
+  const layer = document.getElementById('bankWebBgLayer');
+  if (layer) layer.style.display = 'none';
+  // 同时移除交互按钮
+  const btn = document.getElementById('bgInteractBtn');
+  if (btn) btn.remove();
+}
+// 切换网页背景交互模式：开启时 iframe 覆盖全屏可交互，关闭时回到背景模式
+function toggleBgInteract() {
+  const layer = document.getElementById('bankWebBgLayer');
+  if (!layer) return;
+  const isInteractive = layer.dataset.interactive === '1';
+  if (isInteractive) {
+    layer.dataset.interactive = '0';
+    layer.style.zIndex = '-1';
+    const frame = document.getElementById('bankWebBgFrame');
+    if (frame) frame.style.pointerEvents = 'none';
+    const btn = document.getElementById('bgInteractBtn');
+    if (btn) btn.textContent = '🖐';
+    // 恢复遮罩
+    const shade = document.getElementById('bankWebBgShade');
+    if (shade) shade.style.opacity = shade.dataset.overlay || '0';
+  } else {
+    layer.dataset.interactive = '1';
+    layer.style.zIndex = '9999';
+    const frame = document.getElementById('bankWebBgFrame');
+    if (frame) frame.style.pointerEvents = 'auto';
+    // 临时去掉遮罩以便清晰交互
+    const shade = document.getElementById('bankWebBgShade');
+    if (shade) {
+      shade.dataset.overlay = shade.style.opacity;
+      shade.style.opacity = '0';
+    }
+    const btn = document.getElementById('bgInteractBtn');
+    if (btn) btn.textContent = '🔒';
+  }
+}
+// ============ 题库背景音乐 (BGM) ============
+
+const AUDIO_FILE_EXT = /\.(mp3|wav|ogg|m4a|aac|flac|webm|opus)$/i;
+// 获取/创建全局背景音乐元素（全程复用同一个，避免重复创建）
+function getBgmAudio() {
+  if (bgmAudio) return bgmAudio;
+  bgmAudio = new Audio();
+  bgmAudio.preload = 'auto';
+  bgmAudio.volume = settings.bgmVolume;
+  bgmAudio.addEventListener('ended', onBgmEnded);
+  bgmAudio.addEventListener('error', onBgmError);
+  return bgmAudio;
+}
+// 当前曲目播放结束：有下一首就放下一首，否则回到第一首（整组循环）
+function onBgmEnded() {
+  if (bgmPlaylist.length <= 1) return; // 单首时 audio.loop=true 已处理
+  bgmIndex = (bgmIndex + 1) % bgmPlaylist.length;
+  const a = getBgmAudio();
+  a.src = bgmPlaylist[bgmIndex];
+  a.play().catch(() => {});
+}
+// 当前曲目加载失败：跳过到下一首，避免卡死
+function onBgmError() {
+  const a = getBgmAudio();
+  if (a.error && a.error.code === 1) return;
+  if (bgmPlaylist.length <= 1) return;
+  const skipTo = (bgmIndex + 1) % bgmPlaylist.length;
+  if (skipTo === bgmIndex) return;
+  bgmIndex = skipTo;
+  a.src = bgmPlaylist[bgmIndex];
+  a.play().catch(() => {});
+}
+// 根据题库 bgm 字段解析出播放列表（URL数组，已按文件名排序）
+async function resolveBgmPlaylist(bgmField) {
+  if (!bgmField) return [];
+  if (Array.isArray(bgmField)) {
+    return bgmField.map(s => String(s).trim()).filter(Boolean);
+  }
+  const value = String(bgmField).trim();
+  if (!value) return [];
+  if (/^(https?:)?\/\//i.test(value) && AUDIO_FILE_EXT.test(value.split(/[?#]/)[0])) {
+    return [value];
+  }
+  if (AUDIO_FILE_EXT.test(value.split(/[?#]/)[0])) {
+    return [value];
+  }
+  // 否则视为目录：请求服务器列出该目录下的音频文件，按文件名自然顺序返回
+  const cacheKey = BGM_DIR_CACHE_PREFIX + value.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const cached = await getServerCache(cacheKey);
+  if (cached && Array.isArray(cached.files) && cached.ts && (Date.now() - cached.ts) < BANK_CACHE_MAX_AGE) {
+    return cached.files;
+  }
+  try {
+    const r = await fetch('/api/bgm-files?dir=' + encodeURIComponent(value));
+    if (!r.ok) return [];
+    const data = await r.json();
+    if (!data || !data.success || !Array.isArray(data.files)) return [];
+    // 拼接为站点内绝对路径
+    const files = data.files.map(f => (value.endsWith('/') ? value : value + '/') + f);
+    setServerCache(cacheKey, { files, ts: Date.now() });
+    return files;
+  } catch (e) {
+    console.warn('读取BGM目录失败:', value, e.message);
+    return [];
+  }
+}
+// BGM 加载竞态标记：快速切换题库时，过期的加载结果不得再改写 src
+let bgmLoadToken = 0;
+// 加载并启动当前题库的背景音乐
+async function loadBankBgm() {
+  const myToken = ++bgmLoadToken;
+  const list = await resolveBgmPlaylist(currentBank ? currentBank.bgm : null);
+  if (myToken !== bgmLoadToken) return;
+  bgmPlaylist = list;
+  bgmIndex = 0;
+  const a = getBgmAudio();
+  a.pause();
+  if (!list.length) {
+    a.removeAttribute('src');
+    try { a.load(); } catch (e) {}
+    updateBgmNextBtnVisibility();
+    return;
+  }
+  a.loop = list.length === 1; // 仅一首时用原生循环；多首时手动切歌
+  const firstSrc = list[0];
+  // 比较解析后的绝对 URL，避免相对路径与绝对路径不等导致重复设置 src 触发 ERR_ABORTED
+  const firstAbs = new URL(firstSrc, location.href).href;
+  if (a.src !== firstAbs) {
+    a.src = firstSrc;
+  }
+  a.volume = settings.bgmVolume;
+  if (bgmUserGesture && currentPlayer) tryStartBgm();
+  updateBgmNextBtnVisibility();
+}
+// 在用户首次交互后启动/恢复背景音乐（绕过浏览器自动播放限制）
+function resumeBgmOnGesture() {
+  bgmUserGesture = true;
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  if (!settings.music) return;
+  tryStartBgm();
+}
+// 尝试播放当前曲目；src 未就绪时稍后重试，play() 被拒时也重试一次
+function tryStartBgm() {
+  if (!settings.music || !bgmPlaylist.length) return;
+  if (!currentPlayer) return; // 未登录不播放
+  const a = getBgmAudio();
+  if (!a.src) a.src = bgmPlaylist[bgmIndex];
+  const p = a.play();
+  if (p && typeof p.catch === 'function') {
+    p.catch(() => {
+      if (bgmUserGesture && settings.music) {
+        setTimeout(() => {
+          if (a.paused && settings.music) a.play().catch(() => {});
+        }, 300);
+      }
+    });
+  }
+}
+// 立即停止背景音乐
+function stopBgm() {
+  if (bgmAudio) {
+    bgmAudio.pause();
+    bgmAudio.currentTime = 0;
+  }
+}
+// 设置页切换音乐开关
+function setMusicEnabled(enabled) {
+  settings.music = !!enabled;
+  if (settings.music) {
+    tryStartBgm();
+  } else {
+    stopBgm();
+  }
+  updateBgmNextBtnVisibility();
+}
+// 手动切换到下一首BGM（单曲时重播当前曲目）
+function nextBgmTrack() {
+  if (!bgmPlaylist.length) return;
+  if (bgmPlaylist.length > 1) {
+    bgmIndex = (bgmIndex + 1) % bgmPlaylist.length;
+  }
+  const a = getBgmAudio();
+  a.src = bgmPlaylist[bgmIndex];
+  a.loop = bgmPlaylist.length === 1;
+  if (settings.music) a.play().catch(() => {});
+}
+// 更新“下一首”按钮显示状态：仅当背景音乐启用且有播放列表时显示
+function updateBgmNextBtnVisibility() {
+  const btn = document.getElementById('bgmNextBtn');
+  if (!btn) return;
+  if (settings.music && bgmPlaylist.length > 0) {
+    btn.classList.remove('hide');
+  } else {
+    btn.classList.add('hide');
+  }
+}
+
+function setBgmVolume(v) {
+  v = Number(v);
+  if (!isFinite(v)) return;
+  v = Math.max(0, Math.min(1, v));
+  settings.bgmVolume = v;
+  if (bgmAudio) bgmAudio.volume = v;
+}
+// 解析背景图地址：http(s)、协议相对、data URI 直接使用，其余视为站内相对路径
+function resolveBankBgSrc(src) {
+  if (/^(https?:)?\/\//i.test(src) || /^data:/i.test(src)) return src;
+  return src;
+}
+// 渲染当前题库背景：图片先预加载成功再显示；网页直接用底层 iframe；失败回退默认背景
+function renderBankBackground() {
+  const body = document.body;
+  const conf = normalizeBankBackground(currentBank ? currentBank.background : null);
+  const token = ++bankBgToken;
+  if (!conf) {
+    hideBankWebBackground();
+    body.style.background = '';
+    body.style.backgroundColor = '';
+    body.style.backgroundSize = '';
+    return;
+  }
+  if (conf.kind === 'webpage') {
+    body.style.background = 'transparent';
+    body.style.backgroundColor = 'transparent';
+    body.style.backgroundSize = '';
+    showBankWebBackground(conf);
+    return;
+  }
+  hideBankWebBackground();
+  // 去掉可破坏 url() 语法的字符（题库配置为可信数据，此处做基本防护）
+  const safeSrc = resolveBankBgSrc(conf.src).replace(/["\\\n\r]/g, '');
+  const img = new Image();
+  img.onload = function () {
+    if (token !== bankBgToken) return; // 已切换到其他题库，丢弃过期结果
+    const shade = conf.overlay > 0
+      ? 'linear-gradient(rgba(0,0,0,' + conf.overlay + '),rgba(0,0,0,' + conf.overlay + ')), '
+      : '';
+    if (conf.mode === 'tile') {
+      body.style.background = shade + 'url("' + safeSrc + '") repeat left top';
+      body.style.backgroundSize = 'auto';
+    } else if (conf.mode === 'contain') {
+      body.style.background = shade + 'url("' + safeSrc + '") no-repeat center center fixed';
+      body.style.backgroundSize = 'contain';
+    } else if (conf.mode === 'center') {
+      body.style.background = shade + 'url("' + safeSrc + '") no-repeat center center fixed';
+      body.style.backgroundSize = 'auto';
+    } else { // cover（默认）：填满全屏并裁剪超出部分
+      body.style.background = shade + 'url("' + safeSrc + '") no-repeat center center fixed';
+      body.style.backgroundSize = 'cover';
+    }
+  };
+  img.onerror = function () {
+    if (token !== bankBgToken) return;
+    console.warn('背景图加载失败，已回退默认背景:', conf.src);
+    body.style.background = '';
+    body.style.backgroundSize = '';
+  };
+  img.src = safeSrc;
+}
+// 根据 pages 动态生成导航标签按钮
+function renderBankNav() {
+  const nav = document.getElementById('navContainer');
+  if (!nav) return;
+  nav.innerHTML = '';
+  bankPages.forEach(p => {
+    const btn = document.createElement('button');
+    btn.className = 'nav-btn';
+    btn.id = 'nav-' + safeDomKey(p.key);
+    btn.textContent = (langData?.nav?.[p.key]) || (langData?.categories?.[p.key]) || p.name;
+    btn.onclick = function () { playSound('click'); showCategory(p.key); };
+    nav.appendChild(btn);
+  });
+}
+// 根据 pages 动态生成各标签页的关卡容器
+function renderBankPages() {
+  const container = document.getElementById('categoryContainer');
+  if (!container) return;
+  container.innerHTML = '';
+  bankPages.forEach(p => {
+    const d = document.createElement('div');
+    d.className = 'category-content hide';
+    d.id = 'page-' + safeDomKey(p.key) + 'Content';
+    const h = document.createElement('h2');
+    h.className = 'category-title';
+    h.textContent = (langData?.nav?.[p.key]) || (langData?.categories?.[p.key]) || p.name;
+    const w = document.createElement('div');
+    w.className = 'level-select';
+    w.id = 'page-' + safeDomKey(p.key) + 'LevelWrap';
+    d.appendChild(h);
+    d.appendChild(w);
+    container.appendChild(d);
+  });
+}
+// 渲染左下角题库切换菜单
+function renderBankMenu() {
+  const list = document.getElementById('bankMenuList');
+  if (!list) return;
+  list.innerHTML = '';
+  if (!bankList.length) {
+    const empty = document.createElement('div');
+    empty.className = 'bank-menu-empty';
+    empty.textContent = langData?.bank?.empty || '暂无可选题库';
+    list.appendChild(empty);
+  } else {
+    bankList.forEach(b => {
+      const btn = document.createElement('button');
+      btn.className = 'bank-menu-item' + (b.id === currentBankId ? ' active' : '');
+      const name = document.createElement('span');
+      name.className = 'bank-item-name';
+      name.textContent = b.name;
+      const tag = document.createElement('span');
+      tag.className = 'bank-item-tag';
+      tag.textContent = b.id === currentBankId ? (langData?.bank?.currentTag || '当前') : '';
+      btn.appendChild(name);
+      btn.appendChild(tag);
+      btn.onclick = function () { playSound('click'); switchBank(b.id); };
+      list.appendChild(btn);
+    });
+  }
+  const sw = document.getElementById('bankSwitchBtn');
+  if (sw) {
+    const cur = bankList.find(b => b.id === currentBankId);
+    sw.title = cur ? cur.name : '';
+  }
+}
+
+function toggleBankMenu(forceClose) {
+  const menu = document.getElementById('bankMenu');
+  if (forceClose === true) {
+    menu.classList.add('hide');
+    return;
+  }
+  renderBankMenu();
+  menu.classList.toggle('hide');
+}
+
+function firstPageKey() {
+  return bankPages.length ? bankPages[0].key : null;
+}
+
+function getPage(key) {
+  return bankPages.find(p => p.key === key) || null;
+}
+// 按标签页关数补齐进度数组
+function normalizeProgressArray(arr, len) {
+  const out = new Array(len).fill(null);
+  if (Array.isArray(arr)) {
+    for (let i = 0; i < len; i++) {
+      if (arr[i]) out[i] = arr[i];
+    }
+  }
+  return out;
+}
+// 从服务器玩家数据中读取当前题库的通关进度
+function applyBankProgress(data) {
+  data = data || {};
+  const storeKey = currentBankId + '-completelevel';
+  let store = (data[storeKey] && typeof data[storeKey] === 'object') ? data[storeKey] : null;
+  if (!store && currentBankId === 'default') {
+    store = {
+      xiehouyu: data.completedLevels,
+      gushi: data.gushiCompletedLevels,
+      caizi: data.caiziCompletedLevels
+    };
+  }
+  bankPages.forEach(p => {
+    pageProgressMap[p.key] = normalizeProgressArray(store ? store[p.key] : null, p.levels.length);
+  });
+}
+// 校验用户名格式：1-20位中英文、数字、下划线
+function isValidUsername(name) {
+  return typeof name === 'string' && /^[\u4e00-\u9fa5a-zA-Z0-9_]{1,20}$/.test(name);
+}
+// ============ 积分系统 ============
+function prizeToPoints(prize) {
+  if (prize === '一等奖' || prize === 'First Prize') return 3;
+  if (prize === '二等奖' || prize === 'Second Prize') return 2;
+  if (prize === '三等奖' || prize === 'Third Prize') return 1;
+  return 0;
+}
+// 更新积分徽章显示
+function updatePointsBadge() {
+  const el = document.getElementById('pointsValue');
+  if (el) el.textContent = String(playerPoints);
+}
+// 结算本次通关积分并累加到玩家积分：
+function settleLevelPoints(prevPrize, newPrize, correctCount, totalQuestions) {
+  let gained;
+  if (!prevPrize) {
+    gained = prizeToPoints(newPrize);
+  } else if (totalQuestions > 0 && correctCount >= totalQuestions) {
+    gained = 3;
+  } else if (correctCount >= 3) {
+    gained = 2;
+  } else if (correctCount >= 1) {
+    gained = 1;
+  } else {
+    gained = 0;
+  }
+  if (gained > 0) {
+    gained = Math.round(gained * (1 + 0.1 * getPointsBonusLevel()));
+    playerPoints += gained;
+    updatePointsBadge();
+  }
+  return gained;
+}
+// 从玩家数据初始化积分：points 字段不存在（旧存档）时，
+function initPointsFromProgress(data) {
+  playerPoints = Math.max(0, parseInt((data && data.points), 10) || 0);
+  updatePointsBadge();
+}
+// ============ 成就系统（全屏，分通用成就与本题库成就，定义由题库 achievements 字段自定义） ============
+const ACHIEVEMENT_LOGO_DIR = 'resource/achievement-logo';
+const LOGO_EXTS = ['png', 'jpg', 'svg', 'webp', 'gif'];
+// type: 'levels'完成任意关卡数 | 'first'一等奖关数 | 'second'二等奖关数 | 'third'三等奖关数
+let universalAchievements = []; // 通用成就池（default.json 中 scope:'global' 的成就，任何题库下都显示）
+let claimedAchievements = []; // 已领取奖励的成就id（持久化在玩家数据 achvClaimed）
+let playerFlags = { easter: false, vipLink: false }; // 一次性事件标志（触发彩蛋/VIP链接，持久化）
+let pendingClaim = null; // 当前待领取奖励的成就定义
+
+try {
+  fetchJsonInWorker('/data/default.json').then(bank => {
+    if (bank && Array.isArray(bank.achievements)) {
+      universalAchievements = bank.achievements.filter(a => a && a.scope === 'global');
+    }
+  }).catch(() => {});
+} catch (e) { /* worker未就绪时忽略，成就列表仍可用本题库定义 */ }
+
+let allBankProgress = {}; // 全部题库进度快照 {bankId: {pageKey: [每关评价]}}（用于通用成就统计）
+// 从玩家数据构建所有题库进度快照
+function buildAllBankProgress(data) {
+  const out = {};
+  for (const [key, value] of Object.entries(data || {})) {
+    if (key.endsWith('-completelevel') && value && typeof value === 'object' && !Array.isArray(value)) {
+      out[key.slice(0, -'-completelevel'.length)] = value;
+    }
+  }
+  if (!out['default']) {
+    const legacy = {};
+    if (Array.isArray(data && data.completedLevels)) legacy.xiehouyu = data.completedLevels;
+    if (Array.isArray(data && data.gushiCompletedLevels)) legacy.gushi = data.gushiCompletedLevels;
+    if (Array.isArray(data && data.caiziCompletedLevels)) legacy.caizi = data.caiziCompletedLevels;
+    if (Object.keys(legacy).length) out['default'] = legacy;
+  }
+  allBankProgress = out;
+}
+// 通关后同步快照中当前题库的进度（全局成就实时更新）
+function syncAllBankProgress() {
+  if (!currentBankId) return;
+  const copy = {};
+  for (const [k, v] of Object.entries(pageProgressMap)) copy[k] = v.slice();
+  allBankProgress[currentBankId] = copy;
+}
+// 读取当前题库的成就定义：[{icon,name,desc,type,target,scope}]
+function getAchievementDefs() {
+  const list = currentBank && Array.isArray(currentBank.achievements) ? currentBank.achievements : [];
+  return list.filter(a => a && typeof a === 'object');
+}
+// 在指定题库进度集合中统计成就进度
+function countProgress(banksMap, type) {
+  let cur = 0;
+  for (const pages of Object.values(banksMap || {})) {
+    for (const arr of Object.values(pages || {})) {
+      if (!Array.isArray(arr)) continue;
+      for (const prize of arr) {
+        if (!prize) continue;
+        const pts = prizeToPoints(prize);
+        if (type === 'levels') cur++;
+        else if (type === 'first' && pts === 3) cur++;
+        else if (type === 'second' && pts === 2) cur++;
+        else if (type === 'third' && pts === 1) cur++;
+      }
+    }
+  }
+  return cur;
+}
+// 计算单个成就当前进度：scope==='global' 跨所有题库，'bank' 仅当前题库
+function achievementProgress(def) {
+  const target = Math.max(1, parseInt(def.target, 10) || 1);
+  const type = String(def.type || 'levels');
+  let cur;
+  if (type === 'points') {
+    cur = playerPoints;
+  } else if (type === 'easter') {
+    cur = playerFlags.easter ? 1 : 0;
+  } else if (type === 'vip') {
+    cur = playerFlags.vipLink ? 1 : 0;
+  } else if (def.scope === 'bank') {
+    cur = countProgress({ bank: pageProgressMap }, type);
+  } else {
+    cur = countProgress(allBankProgress, type);
+  }
+  return { cur: Math.min(cur, target), target, done: cur >= target };
+}
+// 成就logo地址（按扩展名依次尝试）
+function achievementLogoUrl(id, extIndex) {
+  const safeId = String(id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+  return ACHIEVEMENT_LOGO_DIR + '/' + safeId + '.' + LOGO_EXTS[extIndex || 0];
+}
+// 构建单个成就卡片：左侧正方形logo（加载失败回退🏅占位），右侧上方成就名、下方详细完成信息
+function buildAchievementCard(def) {
+  const p = achievementProgress(def);
+  const card = document.createElement('div');
+  card.className = 'achv-card' + (p.done ? ' done' : '');
+  const logoWrap = document.createElement('div');
+  logoWrap.className = 'achv-logo-fallback';
+  logoWrap.textContent = '🏅';
+  const tryExt = i => {
+    if (i >= LOGO_EXTS.length) return;
+    const img = document.createElement('img');
+    img.className = 'achv-logo';
+    img.alt = def.name || 'achievement';
+    img.onload = () => { logoWrap.textContent = ''; logoWrap.appendChild(img); };
+    img.onerror = () => { img.remove(); tryExt(i + 1); };
+    img.src = achievementLogoUrl(def.id, i);
+  };
+  tryExt(0);
+  card.appendChild(logoWrap);
+  const info = document.createElement('div');
+  info.className = 'achv-info';
+  const name = document.createElement('div');
+  name.className = 'achv-name';
+  name.textContent = (typeof def.name === 'string' && def.name ? def.name : (langData?.achv?.unnamed || '未命名成就')) + (p.done ? ' ✅' : '') + (def.hidden ? ' 🔒' : '');
+  info.appendChild(name);
+  const desc = document.createElement('div');
+  desc.className = 'achv-desc';
+  desc.textContent = typeof def.desc === 'string' && def.desc ? def.desc : '';
+  info.appendChild(desc);
+  const meta = document.createElement('div');
+  meta.className = 'achv-meta';
+  const bar = document.createElement('div');
+  bar.className = 'achv-bar';
+  const fill = document.createElement('div');
+  fill.className = 'achv-bar-fill';
+  fill.style.width = Math.round(p.cur / p.target * 100) + '%';
+  bar.appendChild(fill);
+  const count = document.createElement('div');
+  count.className = 'achv-count';
+  count.textContent = p.cur + ' / ' + p.target;
+  meta.appendChild(bar);
+  meta.appendChild(count);
+  info.appendChild(meta);
+  card.appendChild(info);
+  return card;
+}
+
+function showAchievements() {
+  const overlay = document.getElementById('achievementOverlay');
+  const grid = document.getElementById('achvGrid');
+  const empty = document.getElementById('achvEmpty');
+  document.getElementById('achvTitleText').textContent = langData?.achv?.title || '成就';
+  document.getElementById('achvPointsText').textContent =
+    (langData?.points?.title || '积分') + '：' + playerPoints;
+  // 汇总：通用成就（default.json 全局组）+ 当前题库自定义成就（scope==='global' 归全局组，否则归本题库组），并按id去重
+  const bankDefs = getAchievementDefs();
+  const globalDefs = dedupeAchievements(universalAchievements.concat(bankDefs.filter(d => d.scope === 'global')));
+  const localDefs = bankDefs.filter(d => d.scope !== 'global');
+  grid.innerHTML = '';
+  let hasAny = false;
+  const buildGroup = (titleText, defs) => {
+    const visible = defs.filter(def => {
+      if (!def.hidden) return true;
+      if (String(def.id) === 'superuser') return true;
+      return achievementProgress(def).done;
+    });
+    if (!visible.length) return;
+    hasAny = true;
+    const t = document.createElement('div');
+    t.className = 'achv-group-title';
+    t.textContent = titleText;
+    grid.appendChild(t);
+    visible.forEach(def => grid.appendChild(buildAchievementCard(def)));
+  };
+  buildGroup(langData?.achv?.globalTitle || '全局成就', globalDefs);
+  buildGroup(langData?.achv?.bankTitle || '本题库成就', localDefs);
+  if (!hasAny) {
+    grid.classList.add('hide');
+    empty.classList.remove('hide');
+    empty.textContent = langData?.achv?.empty || '这里只有棍木:(';
+  } else {
+    empty.classList.add('hide');
+    grid.classList.remove('hide');
+  }
+  overlay.classList.remove('hide');
+}
+
+function hideAchievements() {
+  document.getElementById('achievementOverlay').classList.add('hide');
+}
+// ============ 成就奖励领取 ============
+function dedupeAchievements(defs) {
+  const seen = new Set();
+  const out = [];
+  for (const def of defs) {
+    const key = String(def.id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(def);
+  }
+  return out;
+}
+// 检查已完成但未领取奖励的成就，弹出领取弹窗（仿彩蛋窗口，配色跟随题库主题）
+function checkAchievementClaim() {
+  if (!currentPlayer) return;
+  const win = document.getElementById('achvClaimWindow');
+  if (!win || !win.classList.contains('hide')) return; // 已有领取弹窗在显示
+  const bankDefs = getAchievementDefs();
+  const defs = dedupeAchievements(universalAchievements.concat(bankDefs));
+  for (const def of defs) {
+    if (claimedAchievements.includes(String(def.id))) continue;
+    if (!achievementProgress(def).done) continue;
+    pendingClaim = def;
+    document.getElementById('achvClaimName').textContent =
+      (langData?.achv?.claimDone || '你完成了「{{name}}」成就！').replace('{{name}}', def.name || def.id);
+    document.getElementById('achvClaimBtnText').textContent =
+      (langData?.achv?.claimBtn || '领取 {{points}} 积分').replace('{{points}}', String(parseInt(def.reward, 10) || 0));
+    win.classList.remove('hide');
+    playSound('win');
+    return;
+  }
+}
+// 领取奖励：加积分、记录已领取并持久化、关闭弹窗；若还有其他可领取成就则继续弹出
+function claimAchievementReward() {
+  if (pendingClaim) {
+    const reward = Math.max(0, parseInt(pendingClaim.reward, 10) || 0);
+    playerPoints += reward;
+    updatePointsBadge();
+    if (!claimedAchievements.includes(String(pendingClaim.id))) {
+      claimedAchievements.push(String(pendingClaim.id));
+    }
+    saveProgress();
+    pendingClaim = null;
+  }
+  hideAchvClaim();
+  setTimeout(checkAchievementClaim, 500);
+}
+
+function hideAchvClaim() {
+  document.getElementById('achvClaimWindow').classList.add('hide');
+}
+// ============ 商店系统（全屏，样式复用成就页；聚合所有题库 shop 字段的自定义卖品） ============
+let ownedShopItems = []; // 已购买卖品id（持久化在玩家数据 shopOwned）
+let shopLevels = {}; // 等级卖品进度 {卖品id: 当前等级}（持久化在玩家数据 shopLevels）
+let uiEffectsEnabled = {}; // 视觉类商品启用状态 {effect: true/false}，默认空=全部启用
+let allBankShopItems = null; // 聚合后的卖品 [{...定义, bankId, bankName}]；null=尚未加载
+let pendingBuy = null; // 当前确认购买 {item, mode: 'buy'|'upgrade'}
+// 从题库列表接口聚合所有题库的卖品定义
+async function loadShopItems() {
+  try {
+    const r = await fetchJsonInWorker('/api/banks');
+    const banks = (r && r.banks) || [];
+    const items = [];
+    for (const b of banks) {
+      const defs = Array.isArray(b.shop) ? b.shop : [];
+      for (const it of defs) {
+        if (!it || typeof it !== 'object' || !it.id) continue;
+        items.push(Object.assign({}, it, { bankId: b.id, bankName: b.name || b.id }));
+      }
+    }
+    allBankShopItems = items;
+    applyUiEffects();
+  } catch (e) {
+    allBankShopItems = [];
+  }
+}
+
+function showShop() {
+  if (!currentPlayer) return;
+  document.getElementById('shopTitleText').textContent = langData?.shop?.title || '商店';
+  document.getElementById('shopPointsText').textContent =
+    (langData?.points?.title || '积分') + '：' + playerPoints;
+  const empty = document.getElementById('shopEmpty');
+  empty.textContent = langData?.shop?.empty || '卖品也许被妖猫吞了!';
+  const open = () => {
+    renderShop();
+    document.getElementById('shopOverlay').classList.remove('hide');
+  };
+  if (allBankShopItems === null) loadShopItems().then(open);
+  else open();
+}
+
+function hideShop() {
+  document.getElementById('shopOverlay').classList.add('hide');
+}
+// 渲染商店卡片（空则显示占位文案；maxLevel>0 为等级商品，可重复购买升级）
+function renderShop() {
+  const grid = document.getElementById('shopGrid');
+  const empty = document.getElementById('shopEmpty');
+  const items = allBankShopItems || [];
+  grid.innerHTML = '';
+  if (!items.length) {
+    grid.classList.add('hide');
+    empty.classList.remove('hide');
+    return;
+  }
+  empty.classList.add('hide');
+  grid.classList.remove('hide');
+  const ownedText = langData?.shop?.owned || '已拥有';
+  const buyText = langData?.shop?.buy || '购买';
+  const insufficientText = langData?.shop?.insufficient || '积分不足';
+  const maxedText = langData?.shop?.maxed || '已满级 ✅';
+  for (const item of items) {
+    const id = String(item.id);
+    const price = Math.max(0, parseInt(item.price, 10) || 0);
+    const maxLv = Math.max(0, parseInt(item.maxLevel, 10) || 0); // 等级商品上限，0=一次性商品
+    const lv = Math.min(maxLv || 0, Math.max(0, parseInt(shopLevels[id], 10) || 0));
+    const owned = ownedShopItems.includes(id);
+    const card = document.createElement('div');
+    card.className = 'achv-card' + ((owned && (!maxLv || lv >= maxLv)) ? ' done' : '');
+    // 左侧图标（题库可指定 icon emoji，缺省🛒）
+    const iconWrap = document.createElement('div');
+    iconWrap.className = 'shop-card-icon';
+    iconWrap.textContent = typeof item.icon === 'string' && item.icon ? item.icon : '🛒';
+    card.appendChild(iconWrap);
+    // 右侧：名称+等级徽章 / 描述 / 价格 / 来源题库 / 等级进度 / 购买按钮
+    const info = document.createElement('div');
+    info.className = 'achv-info';
+    const name = document.createElement('div');
+    name.className = 'achv-name';
+    name.textContent = (typeof item.name === 'string' && item.name ? item.name : id) + (owned && (!maxLv || lv >= maxLv) ? ' ✅' : '');
+    if (item.tier !== undefined && item.tier !== null && item.tier !== '') {
+      const tier = document.createElement('span');
+      tier.className = 'shop-tier';
+      tier.textContent = String(item.tier);
+      name.appendChild(tier);
+    }
+    info.appendChild(name);
+    const desc = document.createElement('div');
+    desc.className = 'achv-desc';
+    desc.textContent = typeof item.desc === 'string' && item.desc ? item.desc : '';
+    info.appendChild(desc);
+    const priceEl = document.createElement('div');
+    priceEl.className = 'shop-price';
+    priceEl.textContent = '💰 ' + price + (langData?.points?.title ? ' ' + langData.points.title : ' 积分') + (maxLv > 1 ? ' / 级' : '');
+    info.appendChild(priceEl);
+    const source = document.createElement('div');
+    source.className = 'shop-source';
+    source.textContent = '📦 ' + (item.bankName || item.bankId || '');
+    info.appendChild(source);
+    if (maxLv > 0) {
+      const meta = document.createElement('div');
+      meta.className = 'achv-meta';
+      const bar = document.createElement('div');
+      bar.className = 'achv-bar';
+      const fill = document.createElement('div');
+      fill.className = 'achv-bar-fill';
+      fill.style.width = Math.round(lv / maxLv * 100) + '%';
+      bar.appendChild(fill);
+      const count = document.createElement('div');
+      count.className = 'achv-count';
+      count.textContent = 'Lv.' + lv + ' / ' + maxLv;
+      meta.appendChild(bar);
+      meta.appendChild(count);
+      info.appendChild(meta);
+    }
+    const btn = document.createElement('button');
+    btn.className = 'btn shop-buy-btn';
+    if (maxLv > 0) {
+      if (lv >= maxLv) {
+        btn.textContent = maxedText;
+        btn.disabled = true;
+      } else {
+        const nextLv = lv + 1;
+        btn.textContent = lv === 0
+          ? (langData?.shop?.buyWithPrice || '购买（{{price}} 积分）').replace('{{price}}', String(price))
+          : (langData?.shop?.upgrade || '升级到 Lv.{{level}}（{{price}} 积分）').replace('{{level}}', String(nextLv)).replace('{{price}}', String(price));
+        const mode = playerPoints < price ? 'poor' : (lv === 0 ? 'buy' : 'upgrade');
+        btn.onclick = () => { playSound('click'); askBuy(item, mode, nextLv); };
+      }
+    } else if (owned) {
+      const isUiEffect = typeof item.effect === 'string' && item.effect.startsWith('ui-') && maxLv === 0;
+      if (isUiEffect) {
+        const enabled = uiEffectsEnabled[item.effect] !== false;
+        btn.textContent = enabled ? '✅ 已启用' : '⭕ 已禁用';
+        btn.disabled = false;
+        btn.onclick = () => { playSound('click'); toggleUiEffect(item.effect); };
+      } else {
+        btn.textContent = ownedText;
+        btn.disabled = true;
+      }
+    } else {
+      btn.textContent = buyText;
+      btn.onclick = () => { playSound('click'); askBuy(item, playerPoints < price ? 'poor' : 'buy', 1); };
+    }
+    info.appendChild(btn);
+    card.appendChild(info);
+    grid.appendChild(card);
+  }
+}
+// 打开购买/升级/积分不足提示弹窗（仿彩蛋窗口）
+function askBuy(item, mode, nextLv) {
+  pendingBuy = { item, mode };
+  const price = Math.max(0, parseInt(item.price, 10) || 0);
+  const name = typeof item.name === 'string' && item.name ? item.name : String(item.id);
+  const msgEl = document.getElementById('shopBuyMsg');
+  const btnTextEl = document.getElementById('shopBuyBtnText');
+  if (mode === 'poor') {
+    document.getElementById('shopBuyTitle').textContent = '💰 ' + (langData?.shop?.poorTitle || '积分不足');
+    msgEl.textContent =
+      (langData?.shop?.poorMsg || '积分不足！购买「{{name}}」需要 {{price}} 积分。')
+        .replace('{{name}}', name).replace('{{price}}', String(price));
+    btnTextEl.textContent = langData?.shop?.poorBtn || '知道了';
+    document.getElementById('shopBuyWindow').classList.remove('hide');
+    return;
+  }
+  document.getElementById('shopBuyTitle').textContent = '🛒 ' + (langData?.shop?.confirmTitle || '确认购买');
+  if (mode === 'upgrade') {
+    msgEl.textContent =
+      (langData?.shop?.upgradeMsg || '确定花费 {{price}} 积分将「{{name}}」升级到 Lv.{{level}} 吗？')
+        .replace('{{price}}', String(price)).replace('{{name}}', name).replace('{{level}}', String(nextLv));
+    btnTextEl.textContent = langData?.shop?.confirmBtnUp || '确认升级';
+  } else {
+    msgEl.textContent =
+      (langData?.shop?.confirmMsg || '确定花费 {{price}} 积分购买「{{name}}」吗？')
+        .replace('{{price}}', String(price)).replace('{{name}}', name);
+    btnTextEl.textContent = langData?.shop?.confirmBtn || '确认购买';
+  }
+  document.getElementById('shopBuyWindow').classList.remove('hide');
+}
+
+function hideShopBuy() {
+  document.getElementById('shopBuyWindow').classList.add('hide');
+  pendingBuy = null;
+}
+// 确认购买/升级：扣积分、更新等级并持久化、刷新列表（积分不足提示窗仅关闭）
+function confirmBuy() {
+  if (pendingBuy) {
+    if (pendingBuy.mode === 'poor') {
+      pendingBuy = null;
+      hideShopBuy();
+      return;
+    }
+    const item = pendingBuy.item;
+    const price = Math.max(0, parseInt(item.price, 10) || 0);
+    const id = String(item.id);
+    const maxLv = Math.max(0, parseInt(item.maxLevel, 10) || 0);
+    if (playerPoints >= price) {
+      if (maxLv > 0) {
+        const cur = Math.min(maxLv, Math.max(0, parseInt(shopLevels[id], 10) || 0));
+        if (cur < maxLv) {
+          playerPoints -= price;
+          updatePointsBadge();
+          shopLevels[id] = cur + 1;
+          if (!ownedShopItems.includes(id)) ownedShopItems.push(id);
+          saveProgress();
+          playSound('win');
+        }
+      } else if (!ownedShopItems.includes(id)) {
+        playerPoints -= price;
+        updatePointsBadge();
+        ownedShopItems.push(id);
+        saveProgress();
+        playSound('win');
+      }
+    }
+    applyUiEffects();
+    pendingBuy = null;
+  }
+  hideShopBuy();
+  renderShop();
+  document.getElementById('shopPointsText').textContent =
+    (langData?.points?.title || '积分') + '：' + playerPoints;
+}
+// 判断是否已拥有某个一次性 UI 效果类商品（effect 如 ui-glass/ui-neon/ui-dark/ui-rainbow/ui-font）
+function hasUiEffect(effect) {
+  for (const it of (allBankShopItems || [])) {
+    if (it.effect !== effect) continue;
+    if (ownedShopItems.includes(String(it.id))) return true;
+  }
+  return false;
+}
+// 根据已拥有的 UI 效果商品切换 body 上的样式类（受 uiEffectsEnabled 开关控制）
+function applyUiEffects() {
+  const body = document.body;
+  if (!body) return;
+  const enabled = (eff) => hasUiEffect(eff) && uiEffectsEnabled[eff] !== false;
+  body.classList.toggle('ui-glass', enabled('ui-glass'));
+  body.classList.toggle('ui-neon', enabled('ui-neon'));
+  body.classList.toggle('ui-dark', enabled('ui-dark'));
+  body.classList.toggle('ui-rainbow', enabled('ui-rainbow'));
+  body.classList.toggle('ui-font', enabled('ui-font'));
+}
+// 切换某个视觉类商品的启用/禁用状态
+function toggleUiEffect(effect) {
+  if (!hasUiEffect(effect)) return;
+  uiEffectsEnabled[effect] = uiEffectsEnabled[effect] === false;
+  saveProgress();
+  applyUiEffects();
+  renderShop();
+}
+// 按效果类型取已拥有等级商品的最大等级（glint=绿闪/time=答题时间/points=积分加成）
+function getShopEffectLevel(effect) {
+  let lv = 0;
+  for (const it of (allBankShopItems || [])) {
+    if (it.effect !== effect) continue;
+    const id = String(it.id);
+    if (!ownedShopItems.includes(id)) continue;
+    const max = Math.max(0, parseInt(it.maxLevel, 10) || 0);
+    if (max <= 0) continue;
+    const cur = Math.min(max, Math.max(0, parseInt(shopLevels[id], 10) || 0));
+    if (cur > lv) lv = cur;
+  }
+  return lv;
+}
+function getGlintLevel() { return getShopEffectLevel('glint'); }
+function getTimeBonusLevel() { return getShopEffectLevel('time'); }
+function getPointsBonusLevel() { return getShopEffectLevel('points'); }
+// 获取（或首次生成）本设备ID：持久化在localStorage中，注册账号时与玩家绑定
+function getDeviceId() {
+  let id = localStorage.getItem('czm_deviceId');
+  if (!id) {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      id = window.crypto.randomUUID();
+    } else {
+      id = 'dev-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+    }
+    localStorage.setItem('czm_deviceId', id);
+  }
+  return id;
+}
+// 初始化登录状态：有本地记录则带着设备ID尝试自动登录，设备不一致会被服务器拒绝
+function initAuth() {
+  const saved = localStorage.getItem('czm_currentPlayer');
+  if (saved) {
+    loginRequest(saved, true);
+  } else {
+    showLoginOverlay();
+  }
+}
+// 显示登录弹窗（可预填用户名、显示提示语）
+function showLoginOverlay(options) {
+  options = options || {};
+  const overlay = document.getElementById('loginOverlay');
+  const input = document.getElementById('usernameInput');
+  const error = document.getElementById('loginError');
+  const pwEl = document.getElementById('passwordInput');
+  const totpEl = document.getElementById('totpInput');
+  if (pwEl) { pwEl.classList.add('hide'); pwEl.value = ''; }
+  if (totpEl) { totpEl.classList.add('hide'); totpEl.value = ''; }
+  if (error) error.textContent = options.hint || '';
+  if (input) input.value = options.prefill || '';
+  overlay.classList.remove('hide');
+  setTimeout(() => {
+    if (input) {
+      input.focus();
+      if (options.prefill) input.select();
+    }
+  }, 100);
+}
+// 隐藏登录弹窗
+function hideLoginOverlay() {
+  document.getElementById('loginOverlay').classList.add('hide');
+}
+// 点击"进入游戏"
+function handleLogin() {
+  const input = document.getElementById('usernameInput');
+  const pwEl = document.getElementById('passwordInput');
+  const totpEl = document.getElementById('totpInput');
+  const error = document.getElementById('loginError');
+  const username = (input.value || '').trim();
+  if (!username) {
+    error.textContent = langData?.auth?.emptyError || '用户名不能为空';
+    return;
+  }
+  if (!isValidUsername(username)) {
+    error.textContent = langData?.auth?.invalidError || '用户名只能包含1-20位中英文、数字或下划线';
+    return;
+  }
+  const password = pwEl && !pwEl.classList.contains('hide') ? pwEl.value : '';
+  const totp = totpEl && !totpEl.classList.contains('hide') ? totpEl.value : '';
+  loginRequest(username, false, password, totp);
+}
+// 向服务器发起登录请求（silent=true为打开页面时的自动登录，会校验设备）
+function loginRequest(username, silent, password, totp) {
+  const error = document.getElementById('loginError');
+  fetch('/api/player/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, deviceId: getDeviceId(), auto: !!silent, password: password || '', totp: totp || '' })
+  })
+    .then(response => response.json())
+    .then(result => {
+      if (result.success) {
+        currentPlayer = result.data.username;
+        currentPlayerHasPassword = !!result.hasPassword;
+        currentPlayerHas2fa = !!result.has2fa;
+        localStorage.setItem('czm_currentPlayer', currentPlayer);
+        hideLoginOverlay();
+        updateUserBadge();
+        loadProgress();
+      } else if (result.errorCode === 'WRONG_PASSWORD') {
+        // 需要密码，显示密码框
+        const pwEl = document.getElementById('passwordInput');
+        if (pwEl) { pwEl.classList.remove('hide'); pwEl.value = ''; pwEl.focus(); }
+        error.textContent = '该账号已设置密码，请输入密码';
+      } else if (result.errorCode === 'WRONG_2FA') {
+        // 需要2FA验证码
+        const pwEl = document.getElementById('passwordInput');
+        const totpEl = document.getElementById('totpInput');
+        if (pwEl && pwEl.classList.contains('hide')) { pwEl.classList.remove('hide'); pwEl.value = ''; }
+        if (totpEl) { totpEl.classList.remove('hide'); totpEl.value = ''; totpEl.focus(); }
+        error.textContent = '该账号已开启2FA，请输入验证码';
+      } else if (!silent) {
+        error.textContent = result.error || (langData?.auth?.loadError || '登录失败，请重试');
+      } else if (result.errorCode === 'DEVICE_MISMATCH') {
+        localStorage.removeItem('czm_currentPlayer');
+        currentPlayer = null;
+        updateUserBadge();
+        showLoginOverlay({ prefill: username, hint: langData?.auth?.deviceMismatch || '检测到设备变更，请输入用户名手动登录' });
+      } else {
+        localStorage.removeItem('czm_currentPlayer');
+        currentPlayer = null;
+        updateUserBadge();
+        showLoginOverlay();
+      }
+    })
+    .catch(err => {
+      console.error('登录失败:', err);
+      if (!silent) {
+        error.textContent = langData?.auth?.loadError || '登录失败，请重试';
+      } else {
+        showLoginOverlay();
+      }
+    });
+}
+// 更新左上角用户区（用户徽章+积分徽章）
+function updateUserBadge() {
+  const area = document.getElementById('userArea');
+  const nameEl = document.getElementById('userBadgeName');
+  if (currentPlayer) {
+    nameEl.textContent = currentPlayer;
+    area.classList.remove('hide');
+  } else {
+    area.classList.add('hide');
+  }
+  document.getElementById('userMenu').classList.add('hide');
+}
+// 切换用户菜单显示
+function toggleUserMenu(event) {
+  event.stopPropagation();
+  document.getElementById('userMenu').classList.toggle('hide');
+}
+
+document.addEventListener('click', function(e) {
+  const menu = document.getElementById('userMenu');
+  if (menu) menu.classList.add('hide');
+  const bankMenu = document.getElementById('bankMenu');
+  const bankBtn = document.getElementById('bankSwitchBtn');
+  if (bankMenu && !bankMenu.classList.contains('hide') &&
+      !bankMenu.contains(e.target) && e.target !== bankBtn && !bankBtn.contains(e.target)) {
+    bankMenu.classList.add('hide');
+  }
+});
+// 切换账号
+function switchAccount() {
+  saveProgress();
+  currentPlayer = null;
+  bgmAudio.pause();
+  localStorage.removeItem('czm_currentPlayer');
+  updateUserBadge();
+  showLoginOverlay();
+}
+// 退出登录
+function logout() {
+  saveProgress();
+  currentPlayer = null;
+  bgmAudio.pause();
+  localStorage.removeItem('czm_currentPlayer');
+  updateUserBadge();
+  showLoginOverlay();
+}
+// ============ 账号安全：密码 & 2FA ============
+// 更新设置页安全区按钮文案
+function refreshSecurityButtons() {
+  const pwdBtn = document.getElementById('pwdManageBtn');
+  const twofaBtn = document.getElementById('twofaManageBtn');
+  if (pwdBtn) pwdBtn.textContent = currentPlayerHasPassword ? (langData?.security?.changePwd || '修改密码') : (langData?.security?.setPwd || '设置密码');
+  if (twofaBtn) twofaBtn.textContent = currentPlayerHas2fa ? (langData?.security?.manage2fa || '管理2FA') : (langData?.security?.enable2fa || '开启2FA');
+}
+// 打开密码管理弹窗
+function openPasswordDialog() {
+  if (!currentPlayer) return;
+  const oldWrap = document.getElementById('pwdOldWrap');
+  const clearWrap = document.getElementById('pwdClearWrap');
+  if (oldWrap) oldWrap.classList.toggle('hide', !currentPlayerHasPassword);
+  if (clearWrap) clearWrap.classList.toggle('hide', !currentPlayerHasPassword);
+  ['pwdOld','pwdNew','pwdNew2'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  document.getElementById('pwdError').textContent = '';
+  document.getElementById('pwdDialog').classList.remove('hide');
+}
+function closePwdDialog() { document.getElementById('pwdDialog').classList.add('hide'); }
+// 提交设置/修改密码
+function submitPassword() {
+  if (!currentPlayer) return;
+  const oldPw = currentPlayerHasPassword ? document.getElementById('pwdOld').value : '';
+  const newPw = document.getElementById('pwdNew').value;
+  const newPw2 = document.getElementById('pwdNew2').value;
+  const errEl = document.getElementById('pwdError');
+  if (currentPlayerHasPassword && !oldPw) { errEl.textContent = '请输入旧密码'; return; }
+  if (newPw.length < 4 || newPw.length > 64) { errEl.textContent = '密码长度需4-64位'; return; }
+  if (newPw !== newPw2) { errEl.textContent = '两次输入的密码不一致'; return; }
+  errEl.textContent = '';
+  fetch('/api/player/password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: currentPlayer, oldPassword: oldPw, newPassword: newPw })
+  }).then(r => r.json()).then(res => {
+    if (res.success) {
+      currentPlayerHasPassword = true;
+      refreshSecurityButtons();
+      closePwdDialog();
+      alert('密码设置成功');
+    } else {
+      errEl.textContent = res.error || '操作失败';
+    }
+  }).catch(() => { errEl.textContent = '网络错误'; });
+}
+// 清除密码
+function clearPassword() {
+  if (!currentPlayer) return;
+  const oldPw = document.getElementById('pwdOld').value;
+  if (!oldPw) { document.getElementById('pwdError').textContent = '请输入旧密码'; return; }
+  if (!confirm('确定清除密码？清除后登录无需密码。')) return;
+  fetch('/api/player/password/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: currentPlayer, oldPassword: oldPw })
+  }).then(r => r.json()).then(res => {
+    if (res.success) {
+      currentPlayerHasPassword = false;
+      refreshSecurityButtons();
+      closePwdDialog();
+      alert('密码已清除');
+    } else {
+      document.getElementById('pwdError').textContent = res.error || '操作失败';
+    }
+  }).catch(() => { document.getElementById('pwdError').textContent = '网络错误'; });
+}
+// 打开2FA管理弹窗
+function open2FADialog() {
+  if (!currentPlayer) return;
+  const setupView = document.getElementById('twofaSetupView');
+  const onView = document.getElementById('twofaOnView');
+  if (currentPlayerHas2fa) {
+    setupView.classList.add('hide');
+    onView.classList.remove('hide');
+    document.getElementById('twofaDisablePwd').value = '';
+    document.getElementById('twofaDisableCode').value = '';
+    document.getElementById('twofaDisableError').textContent = '';
+  } else {
+    setupView.classList.remove('hide');
+    onView.classList.add('hide');
+    document.getElementById('twofaQrWrap').classList.add('hide');
+    document.getElementById('twofaConfirmWrap').classList.add('hide');
+    document.getElementById('twofaPwdWrap').classList.toggle('hide', !currentPlayerHasPassword);
+    document.getElementById('twofaCode').value = '';
+    document.getElementById('twofaPwd').value = '';
+    document.getElementById('twofaError').textContent = '';
+    document.getElementById('twofaStepBtn').textContent = '生成二维码';
+    document.getElementById('twofaStepBtn').onclick = () => { playSound('click'); twofaGenerate(); };
+  }
+  document.getElementById('twofaDialog').classList.remove('hide');
+}
+function close2FADialog() { document.getElementById('twofaDialog').classList.add('hide'); }
+// 生成2FA密钥和二维码
+function twofaGenerate() {
+  if (!currentPlayer) return;
+  const errEl = document.getElementById('twofaError');
+  const pwd = currentPlayerHasPassword ? document.getElementById('twofaPwd').value : '';
+  if (currentPlayerHasPassword && !pwd) { errEl.textContent = '请输入密码'; return; }
+  errEl.textContent = '';
+  fetch('/api/player/2fa/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: currentPlayer, password: pwd })
+  }).then(r => r.json()).then(res => {
+    if (res.success) {
+      document.getElementById('twofaQr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=' + encodeURIComponent(res.otpauth);
+      document.getElementById('twofaSecret').textContent = res.secret;
+      document.getElementById('twofaQrWrap').classList.remove('hide');
+      document.getElementById('twofaConfirmWrap').classList.remove('hide');
+      document.getElementById('twofaPwdWrap').classList.add('hide');
+      document.getElementById('twofaStepBtn').textContent = '确认开启';
+      document.getElementById('twofaStepBtn').onclick = () => { playSound('click'); twofaConfirm(); };
+    } else {
+      errEl.textContent = res.error || '生成失败';
+    }
+  }).catch(() => { errEl.textContent = '网络错误'; });
+}
+// 确认2FA（输入验证码）
+function twofaConfirm() {
+  if (!currentPlayer) return;
+  const code = document.getElementById('twofaCode').value;
+  const errEl = document.getElementById('twofaError');
+  if (!/^\d{6}$/.test(code)) { errEl.textContent = '请输入6位验证码'; return; }
+  errEl.textContent = '';
+  fetch('/api/player/2fa/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: currentPlayer, totp: code })
+  }).then(r => r.json()).then(res => {
+    if (res.success) {
+      currentPlayerHas2fa = true;
+      refreshSecurityButtons();
+      close2FADialog();
+      alert('2FA 开启成功！下次登录需输入验证码。');
+    } else {
+      errEl.textContent = res.error || '验证失败';
+    }
+  }).catch(() => { errEl.textContent = '网络错误'; });
+}
+// 关闭2FA
+function twofaDisable() {
+  if (!currentPlayer) return;
+  const pwd = document.getElementById('twofaDisablePwd').value;
+  const code = document.getElementById('twofaDisableCode').value;
+  const errEl = document.getElementById('twofaDisableError');
+  if (currentPlayerHasPassword && !pwd) { errEl.textContent = '请输入密码'; return; }
+  if (!/^\d{6}$/.test(code)) { errEl.textContent = '请输入6位验证码'; return; }
+  errEl.textContent = '';
+  fetch('/api/player/2fa/disable', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: currentPlayer, password: pwd, totp: code })
+  }).then(r => r.json()).then(res => {
+    if (res.success) {
+      currentPlayerHas2fa = false;
+      refreshSecurityButtons();
+      close2FADialog();
+      alert('2FA 已关闭');
+    } else {
+      errEl.textContent = res.error || '关闭失败';
+    }
+  }).catch(() => { errEl.textContent = '网络错误'; });
+}
+</script>
+
+<button class="btn about-btn" onclick="playSound('click');showAbout()">关于</button>
+<button class="btn help-btn" onclick="playSound('click');showHelp()">帮助</button>
+<button class="btn settings-btn" onclick="playSound('click');showSettings()">设置</button>
+<button class="btn shop-btn" onclick="playSound('click');showShop()">商店</button>
+<button class="btn achv-btn" onclick="playSound('click');showAchievements()">成就</button>
+
+<!-- 成就系统：全屏弹窗，背景随当前题库主题色变化 -->
+<div id="achievementOverlay" class="achv-overlay hide">
+  <div class="achv-panel">
+    <div class="achv-title">🏆 <span id="achvTitleText">成就</span></div>
+    <div class="achv-sub" id="achvPointsText"></div>
+    <div class="achv-grid hide" id="achvGrid"></div>
+    <div class="achv-empty hide" id="achvEmpty">这里只有棍木:(</div>
+    <button class="btn achv-back" onclick="playSound('click');hideAchievements()">返回</button>
+  </div>
+</div>
+
+<!-- 商店系统：全屏弹窗（样式复用成就页），聚合所有题库自定义卖品 -->
+<div id="shopOverlay" class="achv-overlay hide">
+  <div class="achv-panel">
+    <div class="achv-title">🛒 <span id="shopTitleText">商店</span></div>
+    <div class="achv-sub" id="shopPointsText"></div>
+    <div class="achv-grid hide" id="shopGrid"></div>
+    <div class="achv-empty hide" id="shopEmpty">卖品也许被妖猫吞了!</div>
+    <button class="btn achv-back" onclick="playSound('click');hideShop()">返回</button>
+  </div>
+</div>
+
+<!-- 左上角用户区：用户徽章 + 积分徽章 -->
+<div id="userArea" class="user-area hide">
+  <div id="userBadge" class="user-badge" onclick="toggleUserMenu(event)">
+    <span class="user-avatar">👤</span>
+    <span id="userBadgeName"></span>
+    <span style="font-size:10px;opacity:0.8;">▼</span>
+    <div id="userMenu" class="user-menu hide" onclick="event.stopPropagation()">
+      <button onclick="playSound('click');switchAccount()">🔄 <span id="switchAccountText">切换账号</span></button>
+      <button onclick="playSound('click');logout()">🚪 <span id="logoutText">退出登录</span></button>
+    </div>
+  </div>
+  <div id="pointsBadge" class="points-badge" title="积分">💰 <span id="pointsValue">0</span></div>
+</div>
+
+<!-- 下一首BGM按钮（位于用户信息下方，禁用背景音乐时隐藏） -->
+<button id="bgmNextBtn" class="bgm-next-btn hide" onclick="playSound('click');nextBgmTrack()" title="下一首">⏭ <span id="bgmNextText">下一首</span></button>
+
+<!-- 首次登录弹窗 -->
+<div id="loginOverlay" class="login-overlay hide">
+  <div class="login-card">
+    <div class="login-logo">🎯</div>
+    <h2 id="loginTitle">欢迎来到字谜闯关游戏</h2>
+    <p class="login-subtitle" id="loginSubtitle">首次进入请输入用户名，系统将自动为你创建角色</p>
+    <input type="text" id="usernameInput" class="login-input" maxlength="20" placeholder="请输入用户名" autocomplete="off">
+    <input type="password" id="passwordInput" class="login-input hide" placeholder="请输入密码" autocomplete="current-password">
+    <input type="text" id="totpInput" class="login-input hide" placeholder="请输入6位2FA验证码" maxlength="6" inputmode="numeric">
+    <div class="login-error" id="loginError"></div>
+    <button class="btn login-btn" id="loginBtn" onclick="handleLogin()">进入游戏</button>
+  </div>
+</div>
+
+<!-- 密码管理弹窗 -->
+<div id="pwdDialog" class="easter-egg-overlay hide" onclick="if(event.target===this)closePwdDialog()">
+  <div class="easter-egg-window" style="max-width:380px">
+    <div class="easter-egg-title">🔐 密码管理</div>
+    <div class="easter-egg-body" style="text-align:left;padding:20px">
+      <div id="pwdOldWrap" class="hide">
+        <label style="font-size:14px">旧密码</label>
+        <input type="password" id="pwdOld" class="login-input" style="margin:6px 0 12px" placeholder="请输入旧密码">
+      </div>
+      <label style="font-size:14px">新密码</label>
+      <input type="password" id="pwdNew" class="login-input" style="margin:6px 0 12px" placeholder="4-64位">
+      <label style="font-size:14px">确认新密码</label>
+      <input type="password" id="pwdNew2" class="login-input" style="margin:6px 0 12px" placeholder="再次输入新密码">
+      <div id="pwdError" style="color:#e74c3c;font-size:13px;min-height:18px"></div>
+      <div style="display:flex;gap:10px;margin-top:10px">
+        <button class="btn" style="flex:1" onclick="playSound('click');closePwdDialog()">取消</button>
+        <button class="btn" style="flex:1" onclick="playSound('click');submitPassword()">确认</button>
+      </div>
+      <div id="pwdClearWrap" class="hide" style="margin-top:12px;text-align:center">
+        <button class="btn" style="font-size:12px;padding:4px 12px;color:#e74c3c" onclick="playSound('click');clearPassword()">清除密码</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 2FA管理弹窗 -->
+<div id="twofaDialog" class="easter-egg-overlay hide" onclick="if(event.target===this)close2FADialog()">
+  <div class="easter-egg-window" style="max-width:420px">
+    <div class="easter-egg-title">🛡️ 二步验证 (2FA)</div>
+    <div class="easter-egg-body" style="padding:20px">
+      <!-- 未开启：引导开启 -->
+      <div id="twofaSetupView">
+        <p style="font-size:14px;margin:0 0 12px">开启2FA后，登录时除密码外还需输入6位动态验证码，账号更安全。</p>
+        <div id="twofaQrWrap" class="hide" style="text-align:center;margin:12px 0">
+          <img id="twofaQr" style="width:180px;height:180px;border:4px solid #fff;border-radius:8px" alt="2FA QR">
+          <p style="font-size:12px;color:#888;margin:8px 0 4px">无法扫码？手动输入密钥：</p>
+          <code id="twofaSecret" style="background:#f4f4f4;padding:4px 8px;border-radius:4px;font-size:13px;word-break:break-all"></code>
+        </div>
+        <div id="twofaConfirmWrap" class="hide" style="margin-top:12px">
+          <label style="font-size:14px">输入验证器显示的6位验证码</label>
+          <input type="text" id="twofaCode" class="login-input" maxlength="6" inputmode="numeric" style="margin:6px 0 12px;text-align:center;font-size:20px;letter-spacing:4px" placeholder="000000">
+        </div>
+        <div id="twofaPwdWrap" class="hide" style="margin-top:12px">
+          <label style="font-size:14px">账号密码</label>
+          <input type="password" id="twofaPwd" class="login-input" style="margin:6px 0 12px" placeholder="请输入密码">
+        </div>
+        <div id="twofaError" style="color:#e74c3c;font-size:13px;min-height:18px;text-align:center"></div>
+        <div style="display:flex;gap:10px;margin-top:10px">
+          <button class="btn" style="flex:1" onclick="playSound('click');close2FADialog()">取消</button>
+          <button class="btn" id="twofaStepBtn" style="flex:1" onclick="playSound('click');twofaGenerate()">生成二维码</button>
+        </div>
+      </div>
+      <!-- 已开启：显示关闭 -->
+      <div id="twofaOnView" class="hide" style="text-align:center">
+        <p style="font-size:15px">✅ 2FA 已开启</p>
+        <p style="font-size:13px;color:#888;margin:8px 0">关闭2FA需要输入密码和当前验证码。</p>
+        <label style="font-size:14px">账号密码</label>
+        <input type="password" id="twofaDisablePwd" class="login-input" style="margin:6px 0 12px" placeholder="请输入密码">
+        <label style="font-size:14px">2FA验证码</label>
+        <input type="text" id="twofaDisableCode" class="login-input" maxlength="6" inputmode="numeric" style="margin:6px 0 12px;text-align:center;font-size:20px;letter-spacing:4px" placeholder="000000">
+        <div id="twofaDisableError" style="color:#e74c3c;font-size:13px;min-height:18px"></div>
+        <div style="display:flex;gap:10px;margin-top:10px">
+          <button class="btn" style="flex:1" onclick="playSound('click');close2FADialog()">取消</button>
+          <button class="btn" style="flex:1;color:#e74c3c" onclick="playSound('click');twofaDisable()">关闭2FA</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mascot" id="mascotBox" onclick="mascotClick()" style="cursor:pointer;">
+  <svg viewBox="0 0 100 100">
+    <ellipse cx="50" cy="50" rx="30" ry="38" fill="#DC143C"/>
+    <rect x="40" y="8" width="20" height="8" fill="#FFD700" rx="2"/>
+    <rect x="35" y="88" width="30" height="6" fill="#FFD700" rx="2"/>
+    <line x1="50" y1="94" x2="50" y2="100" stroke="#FFD700" stroke-width="2"/>
+    <circle cx="50" cy="50" r="12" fill="#FFD700"/>
+    <circle cx="50" cy="50" r="6" fill="#DC143C"/>
+    <line x1="38" y1="35" x2="62" y2="35" stroke="#FFD700" stroke-width="2"/>
+    <line x1="38" y1="50" x2="62" y2="50" stroke="#FFD700" stroke-width="2"/>
+    <line x1="38" y1="65" x2="62" y2="65" stroke="#FFD700" stroke-width="2"/>
+  </svg>
+</div>
+
+<!-- PK模式按钮 -->
+<button class="pk-mode-btn" onclick="playSound('click');showPKMode()">PK模式</button>
+
+<!-- 左下角自定义题库切换 -->
+<button class="bank-switch-btn" id="bankSwitchBtn" onclick="toggleBankMenu()">📚 <span id="bankSwitchText">题库</span></button>
+<div id="bankMenu" class="bank-menu hide">
+  <div class="bank-menu-title" id="bankMenuTitle">切换题库</div>
+  <div id="bankMenuList"></div>
+</div>
+
+<div class="title-wrap">
+  <span class="title-icon">★</span>
+  <h1 class="title" id="gameTitle" onclick="titleClick()" style="cursor:pointer;user-select:none;">字谜闯关游戏</h1>
+  <span class="title-icon">★</span>
+</div>
+
+<!-- 标签导航与各标签页关卡容器均由题库 pages 动态生成 -->
+<div class="nav-container" id="navContainer"></div>
+<div id="categoryContainer"></div>
+
+<div class="about-page hide" id="aboutPage">
+  <h2>游戏说明</h2>
+  
+  <h3>游戏规则</h3>
+  <ul>
+    <li>游戏有三种字谜可供选择，每个字谜有6~8个关卡，每个关卡包含5道题目</li>
+    <li>每道题目会给出字谜的前半部分，玩家需要从3个选项中选择正确的后半部分</li>
+    <li>选择答案后，系统会立即显示正确与否，并标出正确答案</li>
+    <li>答对题目会显示绿色，答错会显示红色</li>
+    <li>完成所有题目后，会显示本关的正确率</li>
+    <li>点击"下一题"继续答题，完成关卡后自动返回关卡选择界面</li>
+  </ul>
+  
+  <h3>游戏特色</h3>
+  <ul>
+    <li>题目随机：每次开始关卡时，题目顺序都会随机打乱</li>
+    <li>答案随机：部分题目有多个正确答案，每次会随机选择一个</li>
+    <li>干扰项随机：干扰选项也会随机变化，增加游戏挑战性</li>
+    <li>正确率统计：实时统计并显示答题正确率</li>
+    <li>PK模式：支持双人对战，实时竞争答题，增加游戏趣味性</li>
+  </ul>
+  
+  <h3>哈气技巧</h3>
+  <img src="resource/hjm.png" width="80" height="80" style="border-radius:10px; filter:drop-shadow(0 4px 8px rgba(0,0,0,0.2)); margin:10px 0;" />
+  <p>基米语是哈国传统南北中的南北绿豆，通常由两部分组成：前一部分是哈气，后一部分是狒狒。答南北时可以结合哈基米来思考。</p>
+  
+  <div class="creator-info">
+    <p><strong>制作者：</strong>XLNEW,小左ze13</p>
+    <p><strong>开发工具：</strong>TraeCN</p>
+    <p><strong>版本：</strong>V1.6-beta1 20261110</p>
+    <p><strong>在Bilibili找到我们：</strong></p>
+    <p><a href="https://space.bilibili.com/1813056072" target="_blank">举个厉子MC</a></p>
+    <p><a href="https://space.bilibili.com/662813779" target="_blank">小左ze13</a></p>
+  </div>
+  
+  <button class="btn" onclick="playSound('click');hideAbout()" style="margin-top:20px;width:100%">返回游戏</button>
+</div>
+
+<div class="about-page hide" id="helpPage">
+  <h2>游戏帮助</h2>
+  
+  <h3>🎯 游戏规则</h3>
+  <ul>
+    <li>点击关卡按钮开始对应关卡</li>
+    <li>每道题目会显示字谜的前半部分</li>
+    <li>从三个选项中选择你认为正确的后半部分</li>
+    <li>选择后会立即显示正确与否</li>
+    <li>点击"下一题"继续答题</li>
+    <li>完成所有题目后会显示正确率和评价</li>
+  </ul>
+  
+  <h3>💡 答题技巧</h3>
+  <ul>
+    <li>字谜通常由比喻和解释两部分组成</li>
+    <li>注意谐音和双关语的使用</li>
+    <li>结合生活常识和文化背景</li>
+    <li>如果不确定，可以尝试排除法</li>
+  </ul>
+  
+  <h3>🏆 奖励等级</h3>
+  <ul>
+    <li>100%正确率：一等奖 🏆</li>
+    <li>80%-99%正确率：二等奖 🥈</li>
+    <li>60%-79%正确率：三等奖 🥉</li>
+    <li>低于60%：未获奖 💪</li>
+  </ul>
+  
+  <div class="creator-info">
+    <p><strong>提示：</strong>多玩几次可以提高正确率哦！</p>
+  </div>
+  
+  <button class="btn" onclick="playSound('click');hideHelp()" style="margin-top:20px;width:100%">返回游戏</button>
+</div>
+
+<div class="about-page hide" id="settingsPage">
+  <h2>游戏设置</h2>
+  
+  <h3>🎮 游戏设置</h3>
+  <div class="setting-item">
+    <span id="soundLabel">音效</span>
+    <label class="toggle">
+      <input type="checkbox" id="soundToggle" checked>
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+  <div class="setting-item">
+    <span id="musicLabel">背景音乐</span>
+    <label class="toggle">
+      <input type="checkbox" id="musicToggle" checked>
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+  <div class="setting-item" id="bgmVolumeWrap" style="flex-direction:column;align-items:flex-start;gap:6px">
+    <span id="bgmVolumeLabel">音乐音量</span>
+    <input type="range" id="bgmVolumeSlider" min="0" max="1" step="0.05" value="0.4" style="width:100%">
+  </div>
+  <div class="setting-item">
+    <span id="floatLabel">浮动动画</span>
+    <label class="toggle">
+      <input type="checkbox" id="floatToggle">
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+  <div class="setting-item">
+    <span id="languageLabel">语言</span>
+    <select id="languageSelect" style="padding:8px;border-radius:6px;border:1px solid #ddd;background:#f9f9f9;">
+      <option value="zh-cn">中文</option>
+      <option value="en-us">English</option>
+    </select>
+  </div>
+  
+  <h3>📊 进度管理</h3>
+  <div class="setting-item">
+    <button id="deleteAccountBtn" class="btn" onclick="playSound('click');deleteAccount()" style="width:100%">注销用户</button>
+  </div>
+
+  <h3 id="securityTitle">🔐 账号安全</h3>
+  <div class="setting-item" style="flex-direction:column;align-items:stretch;gap:8px">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span id="pwdLabel">登录密码</span>
+      <button class="btn" style="padding:4px 12px;font-size:13px" onclick="playSound('click');openPasswordDialog()" id="pwdManageBtn">设置密码</button>
+    </div>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span id="twofaLabel">二步验证 (2FA)</span>
+      <button class="btn" style="padding:4px 12px;font-size:13px" onclick="playSound('click');open2FADialog()" id="twofaManageBtn">开启2FA</button>
+    </div>
+  </div>
+  
+  <div class="creator-info">
+    <p><strong>提示：</strong>设置会自动保存</p>
+  </div>
+  
+  <button id="returnGameBtn" class="btn" onclick="playSound('click');hideSettings()" style="margin-top:20px;width:100%">返回游戏</button>
+</div>
+
+<!-- 彩蛋窗口 -->
+<div class="hide" id="easterEggWindow" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;background:#DC143C;border:1px solid #333;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:3000;overflow:hidden;">
+  <!-- 窗口标题栏 -->
+  <div style="background:#DC143C;color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+    <span id="easterEggTitle" style="font-weight:bold;font-size:16px;">🎉 恭喜你发现了彩蛋！</span>
+    <div style="display:flex;gap:8px;">
+      <button onclick="playSound('click');hideEasterEgg()" style="background:rgba(255,255,255,0.2);border:none;color:white;cursor:pointer;padding:4px 8px;border-radius:5px;font-size:14px;transition:all 0.3s ease;">✕</button>
+    </div>
+  </div>
+  <!-- 窗口内容 -->
+  <div style="background:#FFD700;padding:18px;">
+    <!-- 图片 -->
+    <div style="text-align:center;margin-bottom:15px;">
+      <img src="https://i.eunie.online/cat/hajimi/80acbfed-ad9f-4327-8adc-66fff69dbe4f_e7fe6489-1e91-46ba-94b2-40136d6f8de9.png" alt="彩蛋图片" style="max-width:100%;height:auto;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.2);">
+    </div>
+    <!-- 消息 -->
+    <div id="easterEggMessage" style="font-size:16px;line-height:1.5;margin-bottom:18px;text-align:center;color:#DC143C;font-weight:bold;">你是一个细心的玩家！
+
+继续享受游戏吧！</div>
+    <!-- 关闭按钮 -->
+    <div style="text-align:center;">
+      <button class="btn" id="easterEggCloseBtn" onclick="playSound('click');hideEasterEgg()" style="padding:10px 20px;font-size:14px;background:#DC143C;color:#FFD700;transition:all 0.3s ease;">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 地铁8号线彩蛋：页面加载后或每次答题后10%概率显示在左侧 -->
+<div class="hide" id="metroEggBtn" onclick="playSound('click');metroEggClick()">
+  <img src="resource/metro_easter_eggggggg.png" alt="彩蛋">
+</div>
+
+<!-- 地铁8号线彩蛋窗口 -->
+<div class="hide" id="metroEggWindow" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;background:#DC143C;border:1px solid #333;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,0.3);z-index:3000;overflow:hidden;">
+  <div style="background:#DC143C;color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+    <span style="font-weight:bold;font-size:16px;">🎉 恭喜你发现了彩蛋！</span>
+    <button onclick="playSound('click');hideMetroEgg()" style="background:rgba(255,255,255,0.2);border:none;color:white;cursor:pointer;padding:4px 8px;border-radius:5px;font-size:14px;transition:all 0.3s ease;">✕</button>
+  </div>
+  <div style="background:#FFD700;padding:18px;">
+    <div style="text-align:center;margin-bottom:15px;">
+      <img src="resource/l8_easter_egg.png" alt="8号线彩蛋" style="max-width:100%;height:auto;border-radius:10px;box-shadow:0 4px 15px rgba(0,0,0,0.2);">
+    </div>
+    <div style="font-size:16px;line-height:1.5;margin-bottom:18px;text-align:center;color:#DC143C;font-weight:bold;">8号线南段开通真的好兴奋！！！</div>
+    <div style="text-align:center;">
+      <button class="btn" onclick="playSound('click');hideMetroEgg()" style="padding:10px 20px;font-size:14px;background:#DC143C;color:#FFD700;transition:all 0.3s ease;">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- VIP彩蛋窗口（连续点击标题5次触发） -->
+<div class="hide" id="vipEggWindow" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;background:#8B0000;border:1px solid #333;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,0.5);z-index:3000;overflow:hidden;">
+  <!-- 窗口标题栏 -->
+  <div style="background:linear-gradient(135deg,#8B0000,#B8860B);color:#FFD700;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+    <span id="vipEggTitle" style="font-weight:bold;font-size:16px;">👑 VIP 专属特权</span>
+    <button onclick="playSound('click');hideVIPEgg()" style="background:rgba(255,255,255,0.2);border:none;color:#FFD700;cursor:pointer;padding:4px 8px;border-radius:5px;font-size:14px;transition:all 0.3s ease;">✕</button>
+  </div>
+  <!-- 窗口内容 -->
+  <div style="background:linear-gradient(135deg,#FFF8DC,#FFD700);padding:26px 18px;text-align:center;">
+    <div style="font-size:48px;margin-bottom:14px;line-height:1;">👑</div>
+    <div id="vipEggDesc" style="font-size:18px;line-height:1.6;margin-bottom:22px;color:#8B0000;font-weight:bold;">点击下方获得vip特权</div>
+    <a id="vipEggLink" href="https://b23.tv/%42%56%31%47%4a%34%31%31%78%37%68%37" target="_blank" rel="noopener noreferrer" onclick="playSound('click');vipLinkClicked()" style="display:inline-block;font-size:20px;font-weight:bold;color:#DC143C;text-decoration:underline;cursor:pointer;margin-bottom:22px;">点我获取</a>
+    <div>
+      <button class="btn" id="vipEggCloseBtn" onclick="playSound('click');hideVIPEgg()" style="padding:10px 20px;font-size:14px;background:#8B0000;color:#FFD700;transition:all 0.3s ease;">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 成就奖励领取弹窗（仿彩蛋窗口风格，配色跟随题库主题；z-index高于彩蛋窗口） -->
+<div class="hide" id="achvClaimWindow" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;background:var(--bank-theme,#DC143C);border:1px solid #333;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,0.35);z-index:3100;overflow:hidden;">
+  <!-- 窗口标题栏 -->
+  <div style="background:var(--bank-theme,#DC143C);color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+    <span id="achvClaimTitle" style="font-weight:bold;font-size:16px;">🎉 成就达成！</span>
+    <button onclick="playSound('click');hideAchvClaim()" style="background:rgba(255,255,255,0.2);border:none;color:white;cursor:pointer;padding:4px 8px;border-radius:5px;font-size:14px;transition:all 0.3s ease;">✕</button>
+  </div>
+  <!-- 窗口内容（同彩蛋窗口：面板底色用字体色，文字用主题色） -->
+  <div style="background:var(--bank-text,#FFD700);padding:26px 18px;text-align:center;">
+    <div style="font-size:48px;margin-bottom:14px;line-height:1;">🏅</div>
+    <div id="achvClaimName" style="font-size:18px;line-height:1.6;margin-bottom:22px;color:var(--bank-theme,#DC143C);font-weight:bold;"></div>
+    <button class="btn" id="achvClaimBtn" onclick="playSound('click');claimAchievementReward()" style="padding:12px 26px;font-size:16px;background:var(--bank-theme,#DC143C);color:white;transition:all 0.3s ease;">
+      <span id="achvClaimBtnText">领取 0 积分</span>
+    </button>
+  </div>
+</div>
+
+<!-- 商店购买确认弹窗（仿彩蛋窗口风格，配色跟随题库主题；z-index高于商店页） -->
+<div class="hide" id="shopBuyWindow" style="position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:400px;background:var(--bank-theme,#DC143C);border:1px solid #333;border-radius:10px;box-shadow:0 8px 32px rgba(0,0,0,0.35);z-index:3200;overflow:hidden;">
+  <!-- 窗口标题栏 -->
+  <div style="background:var(--bank-theme,#DC143C);color:white;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;">
+    <span id="shopBuyTitle" style="font-weight:bold;font-size:16px;">🛒 确认购买</span>
+    <button onclick="playSound('click');hideShopBuy()" style="background:rgba(255,255,255,0.2);border:none;color:white;cursor:pointer;padding:4px 8px;border-radius:5px;font-size:14px;transition:all 0.3s ease;">✕</button>
+  </div>
+  <!-- 窗口内容（同彩蛋窗口：面板底色用字体色，文字用主题色） -->
+  <div style="background:var(--bank-text,#FFD700);padding:26px 18px;text-align:center;">
+    <div style="font-size:48px;margin-bottom:14px;line-height:1;">🛒</div>
+    <div id="shopBuyMsg" style="font-size:18px;line-height:1.6;margin-bottom:22px;color:var(--bank-theme,#DC143C);font-weight:bold;white-space:pre-line;"></div>
+    <button class="btn" id="shopBuyBtn" onclick="playSound('click');confirmBuy()" style="padding:12px 26px;font-size:16px;background:var(--bank-theme,#DC143C);color:white;transition:all 0.3s ease;">
+      <span id="shopBuyBtnText">确认购买</span>
+    </button>
+  </div>
+</div>
+
+<!-- 通关结算窗口（仿彩蛋窗口风格，替代浏览器提示，仅单人模式；配色跟随题库主题色/字体色） -->
+<div id="levelResultOverlay" class="level-result-overlay">
+  <div style="width:min(88vw,620px);background:var(--bank-theme,#DC143C);border:1px solid #333;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.45);overflow:hidden;">
+    <!-- 标题栏 -->
+    <div style="background:var(--bank-theme,#DC143C);color:var(--bank-text,#FFD700);padding:16px 18px;text-align:center;font-weight:bold;font-size:24px;">
+      <span id="levelResultTitle">🎉 第1关通关！</span>
+    </div>
+    <!-- 内容区（同彩蛋窗口：面板底色用字体色，文字用主题色） -->
+    <div style="background:var(--bank-text,#FFD700);padding:28px 22px;">
+      <div id="levelResultBody" style="font-size:20px;line-height:1.9;text-align:center;color:var(--bank-theme,#DC143C);font-weight:bold;white-space:pre-line;">成功率：100%</div>
+      <!-- 本次通关获得的积分 -->
+      <div id="levelResultPoints" style="font-size:16px;text-align:center;color:var(--bank-theme,#DC143C);font-weight:bold;margin-top:10px;"></div>
+      <!-- 操作按钮 -->
+      <div style="display:flex;justify-content:center;gap:14px;margin-top:24px;">
+        <button class="btn" id="levelResultRetryBtn" onclick="playSound('click');retryLevel()" style="padding:12px 26px;font-size:16px;background:var(--bank-theme,#DC143C);background-image:none;color:var(--bank-text,#FFD700);box-shadow:0 4px 15px rgba(0,0,0,0.25);transition:all 0.3s ease;">🔄 再试一次</button>
+        <button class="btn" id="levelResultBackBtn" onclick="playSound('click');backHomeFromResult()" style="padding:12px 26px;font-size:16px;background:var(--bank-theme,#DC143C);background-image:none;color:var(--bank-text,#FFD700);box-shadow:0 4px 15px rgba(0,0,0,0.25);transition:all 0.3s ease;">🏠 返回主页面</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="game hide" id="game">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+    <span style="font-size:20px">📝</span>
+    <span id="questionCounter">第 <span id="cur">1</span> / <span id="total">5</span> 题</span>
+  </div>
+  <div class="progress-bar">
+    <div class="progress-fill" id="progressFill" style="width:0%"></div>
+  </div>
+  <div class="question" id="q"></div>
+  <div class="options" id="opts"></div>
+  <div class="tip" id="tip"></div>
+  <div class="game-timer" id="gameTimer"></div>
+  <div class="game-timer-bar" id="gameTimerBarWrap"><div class="game-timer-bar-fill" id="gameTimerBar"></div></div>
+  <button class="btn next-btn" onclick="playSound('click');next()">下一题 ➡️</button>
+  <button class="btn back-btn" onclick="playSound('click');backLevel()">🏠 返回</button>
+</div>
+
+<!-- PK模式页面 -->
+<div class="pk-mode-container hide" id="pkModeContainer" style="position:fixed;top:0;left:0;width:100%;height:100%;background-color:var(--pk-bg-color, #0a0a0a);background-image:linear-gradient(135deg, #0a0a0a 0%, #121212 33%, #1a1a2e 66%, #16213e 100%);display:none;flex-direction:column;z-index:2000;overflow:hidden;">
+  <!-- 背景特效 -->
+  <div style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0.3;">
+    <div style="position:absolute;top:20%;left:10%;width:200px;height:200px;background:#1a1a2e;border-radius:50%;filter:blur(50px);animation:float 6s ease-in-out infinite;"></div>
+    <div style="position:absolute;top:60%;right:10%;width:150px;height:150px;background:#0f3460;border-radius:50%;filter:blur(40px);animation:float 8s ease-in-out infinite reverse;"></div>
+    <div style="position:absolute;bottom:20%;left:50%;width:180px;height:180px;background:#16213e;border-radius:50%;filter:blur(45px);animation:float 7s ease-in-out infinite;"></div>
+  </div>
+  
+  <!-- 网格背景 -->
+  <div style="position:absolute;top:0;left:0;width:100%;height:100%;background-image:linear-gradient(rgba(100,149,237,0.1) 1px, transparent 1px),linear-gradient(90deg, rgba(100,149,237,0.1) 1px, transparent 1px);background-size:50px 50px;"></div>
+  
+  <!-- PK炫酷文字 -->
+  <div style="text-align:center;margin-top:30px;z-index:1;display:flex;align-items:center;justify-content:center;gap:30px;">
+    <!-- 左侧装饰元素 -->
+    <div style="width:40px;height:40px;background:linear-gradient(45deg, #4499FF, #0f3460);border-radius:50%;box-shadow:0 0 15px rgba(68,153,255,0.6);animation:float 3s ease-in-out infinite;"></div>
+    
+    <!-- PK文字 -->
+    <div style="font-size:80px;font-weight:900;color:#4499FF;text-shadow:0 0 5px #4499FF, 0 0 10px #4499FF, 0 0 15px #0f3460, 0 0 20px #0f3460;letter-spacing:15px;animation:glow 2s ease-in-out infinite alternate;transform:skew(-5deg);font-family: 'Arial Black', sans-serif;">PK</div>
+    
+    <!-- 右侧装饰元素 -->
+    <div style="width:40px;height:40px;background:linear-gradient(45deg, #4499FF, #0f3460);border-radius:50%;box-shadow:0 0 15px rgba(68,153,255,0.6);animation:float 3s ease-in-out infinite reverse;"></div>
+  </div>
+  <!-- 答题区域 -->
+  <div style="flex:1;display:flex;justify-content:space-between;width:90%;max-width:1000px;align-self:center;margin:20px 0;z-index:2;">
+    <!-- 左侧答题区 - 红色主题 -->
+    <div class="pk-player-area" id="pkLeftPlayer" style="flex:1;margin:0 10px;background:rgba(30,30,30,0.95);padding:20px;border-radius:20px;box-shadow:0 8px 32px rgba(220,20,60,0.2);display:flex;flex-direction:column;backdrop-filter:blur(10px);border:3px solid #DC143C;transition:all 0.3s ease;transform:scale(1);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <h3 style="color:#FF4444;font-size:20px;font-weight:bold;text-shadow:0 2px 4px rgba(255,68,68,0.3);">玩家1</h3>
+        <div class="pk-score" id="pkLeftScore" style="font-size:28px;font-weight:bold;color:#FF4444;text-shadow:0 2px 4px rgba(255,68,68,0.3);">0</div>
+      </div>
+      <div class="progress-bar" style="margin-bottom:20px;height:10px;">
+        <div class="progress-fill" id="pkLeftProgress" style="width:0%;background:linear-gradient(90deg, #DC143C, #FF6347);box-shadow:0 0 10px rgba(220,20,60,0.5);"></div>
+      </div>
+      <div class="question" id="pkLeftQuestion" style="flex:1;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:bold;color:#ffffff;padding:16px;text-align:center;">准备开始</div>
+      <div class="options" id="pkLeftOptions"></div>
+    </div>
+    
+    <!-- 右侧答题区 - 蓝色主题 -->
+    <div class="pk-player-area" id="pkRightPlayer" style="flex:1;margin:0 10px;background:rgba(30,30,30,0.95);padding:20px;border-radius:20px;box-shadow:0 8px 32px rgba(30,144,255,0.2);display:flex;flex-direction:column;backdrop-filter:blur(10px);border:3px solid #1E90FF;transition:all 0.3s ease;transform:scale(1);">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <h3 style="color:#4499FF;font-size:20px;font-weight:bold;text-shadow:0 2px 4px rgba(68,153,255,0.3);">玩家2</h3>
+        <div class="pk-score" id="pkRightScore" style="font-size:28px;font-weight:bold;color:#4499FF;text-shadow:0 2px 4px rgba(68,153,255,0.3);">0</div>
+      </div>
+      <div class="progress-bar" style="margin-bottom:20px;height:10px;">
+        <div class="progress-fill" id="pkRightProgress" style="width:0%;background:linear-gradient(90deg, #1E90FF, #4169E1);box-shadow:0 0 10px rgba(30,144,255,0.5);"></div>
+      </div>
+      <div class="question" id="pkRightQuestion" style="flex:1;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:bold;color:#ffffff;padding:16px;text-align:center;">准备开始</div>
+      <div class="options" id="pkRightOptions"></div>
+    </div>
+  </div>
+  
+  <!-- 底部区域 -->
+  <div style="text-align:center;margin-bottom:30px;z-index:2;">
+    <!-- P2P直连隧道状态标识 -->
+    <div id="pkP2pBadge" class="pk-p2p-badge hide"></div>
+    <!-- 计时器和开始按钮 -->
+    <div style="margin-bottom:20px;display:flex;justify-content:center;">
+      <button class="btn" id="pkStartBtn" onclick="playSound('click');showPKMatchmaking()" style="padding:24px 48px;font-size:24px;background:var(--pk-btn-bg,linear-gradient(135deg, #1a1a2e, #0f3460));color:var(--pk-btn-color,white);font-weight:bold;border-radius:15px;box-shadow:0 8px 25px rgba(15,52,96,0.5);transition:all 0.3s ease;animation:pulse 2s infinite; border:2px solid var(--pk-btn-color,#4499FF);">开始游戏</button>
+    </div>
+    
+    <!-- 倒计时 -->
+    <div id="pkTimerContainer" style="display:flex;justify-content:center;">
+      <div id="pkTimer" style="padding:12px 24px;background:linear-gradient(135deg, #1a1a2e 0%, #0f3460 100%);color:white;font-size:20px;font-weight:bold;border-radius:30px;box-shadow:0 4px 15px rgba(15,52,96,0.3);display:inline-flex;align-items:center;gap:10px;">
+        <span>⏰</span>
+        <span>剩余时间：60s</span>
+      </div>
+    </div>
+  </div>
+  
+  <!-- 匹配队列界面 -->
+  <div id="pkMatchOverlay" class="pk-match-overlay hide">
+    <div class="pk-match-box">
+      <div class="pk-match-title" id="pkMatchTitle">匹配队列</div>
+      <div class="pk-match-row">
+        <div class="pk-match-card p1">
+          <div class="pk-match-avatar">👤</div>
+          <div class="pk-match-name" id="pkMatchP1Name">玩家1</div>
+          <div class="pk-match-role" style="color:#FF8888;">P1 · 红方</div>
+        </div>
+        <div class="pk-vs">VS</div>
+        <div class="pk-match-card p2 waiting" id="pkMatchP2Card">
+          <div class="pk-match-avatar" id="pkMatchP2Avatar">⏳</div>
+          <div class="pk-match-name" id="pkMatchP2Name">等待对手加入...</div>
+          <div class="pk-match-role" style="color:#88BBFF;">P2 · 蓝方</div>
+        </div>
+      </div>
+      <div class="pk-match-status" id="pkMatchStatus"><span>正在匹配对手</span><span class="pk-dots"></span></div>
+      <div class="pk-match-hint" id="pkMatchHint">请在另一台设备上打开本页面，进入PK模式并点击开始游戏，即可自动匹配</div>
+      <button class="pk-match-btn pk-match-cancel" id="pkMatchCancelBtn" onclick="playSound('click');pkCancelMatch()">取消匹配</button>
+      <!-- P2P联机码配对：更多联机方式（可展开菜单） -->
+      <div id="pkP2pMoreWrap" style="margin-top:14px;">
+        <button class="pk-p2p-more-btn" id="pkP2pToggleBtn" onclick="playSound('click');pkToggleP2pMenu()"><span id="pkP2pToggleText">更多联机方式</span> <span id="pkP2pToggleArrow">▾</span></button>
+        <div id="pkP2pMenu" class="pk-p2p-menu hide">
+          <button class="pk-p2p-opt" id="pkP2pHostBtn" onclick="playSound('click');pkP2pBeHost()">我想当房主</button>
+          <button class="pk-p2p-opt" id="pkP2pGuestBtn" onclick="playSound('click');pkP2pBeGuest()">我想当房客</button>
+        </div>
+      </div>
+      <!-- 房主等待区：展示6位联机码 -->
+      <div id="pkP2pHostArea" class="pk-p2p-area hide">
+        <div class="pk-p2p-code-label" id="pkP2pCodeLabel">联机码</div>
+        <div class="pk-p2p-code" id="pkP2pCodeText"></div>
+        <div class="pk-p2p-waiting" id="pkP2pWaitingText"><span>等待房客加入...</span><span class="pk-dots"></span></div>
+        <div class="pk-p2p-code-hint" id="pkP2pCodeHint">请将联机码告知对方，对方选择「我想当房客」并输入此码即可配对</div>
+      </div>
+      <!-- 房客输入区：输入联机码加入 -->
+      <div id="pkP2pGuestArea" class="pk-p2p-area hide">
+        <div class="pk-p2p-code-label" id="pkP2pEnterLabel">输入邀请码</div>
+        <div style="display:flex;justify-content:center;gap:10px;align-items:center;margin-top:6px;">
+          <input id="pkP2pCodeInput" class="pk-p2p-input" maxlength="6" placeholder="········" autocomplete="off" spellcheck="false" oninput="pkP2pCodeInputChanged()">
+          <button class="pk-match-btn" id="pkP2pJoinBtn" onclick="playSound('click');pkP2pJoinByCode()">确认加入</button>
+        </div>
+      </div>
+      <div class="pk-match-error" id="pkMatchError"></div>
+    </div>
+  </div>
+
+  <!-- 题库不一致时的双方选题库界面 -->
+  <div id="pkBankOverlay" class="pk-match-overlay hide">
+    <div class="pk-match-box">
+      <div class="pk-match-title" id="pkBankTitle">选择题库</div>
+      <div class="pk-match-hint" id="pkBankPrompt">你与对手当前使用的题库不同，请双方各选择一个相同的题库开始PK</div>
+      <div class="pk-bank-list" id="pkBankList"></div>
+      <div class="pk-match-status" id="pkBankStatus"></div>
+      <button class="pk-match-btn pk-match-cancel" onclick="playSound('click');pkCancelBankSelect()">取消</button>
+    </div>
+  </div>
+
+  <button class="btn" id="pkReturnBtn" onclick="hidePKMode()" style="position:absolute;bottom:30px;right:30px;background:var(--pk-btn-bg,linear-gradient(135deg, #1a1a2e, #0f3460));color:var(--pk-btn-color,white);padding:12px 24px;font-size:18px;font-weight:bold;border-radius:10px;box-shadow:0 4px 15px rgba(15,52,96,0.5);transition:all 0.3s ease; border:1px solid var(--pk-btn-color,#4499FF);z-index:3000;cursor:pointer;">返回主页面</button>
+</div>
+
+<script>// 全局变量和设置
+let currentLevel; // 当前关卡
+let questionList; // 当前关卡的题目列表
+let currentQuestionIndex; // 当前题目索引
+let correctAnswerCount; // 正确答案数量
+// 单人模式每题答题倒计时（10秒，超时按未答处理并标出正确答案）
+const QUESTION_TIME_LIMIT = 10;
+let questionTimerInterval = null;
+let questionTimeLeft = QUESTION_TIME_LIMIT;
+let autoNextTimer = null; // 答题后3秒自动进入下一题
+// 清除自动下一题定时器（手动点击下一题/返回时调用，避免重复跳题）
+function clearAutoNextTimer() {
+  if (autoNextTimer) {
+    clearTimeout(autoNextTimer);
+    autoNextTimer = null;
+  }
+}
+let previousPage = null; // 记录当前页面（标签页key，或答题中为'game'）
+let settings = {
+  floatAnimations: false, // 是否启用浮动动画
+  sound: true, // 是否启用音效
+  music: true, // 是否启用背景音乐
+  bgmVolume: 0.4, // 背景音乐音量 0~1
+  language: 'zh-cn' // 语言设置
+};
+// 题库背景音乐状态
+let bgmAudio = null;
+let bgmPlaylist = []; // 完整URL列表（已按文件名排序）
+let bgmIndex = 0;
+let bgmUserGesture = false; // 用户是否已与页面交互（浏览器自动播放策略）
+// 语言文件内容
+let langData = null;
+// 音效系统
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+function playSound(type) {
+  resumeBgmOnGesture();
+  if (!settings.sound) return;
+  
+  const oscillator = audioCtx.createOscillator();
+  const gainNode = audioCtx.createGain();
+  oscillator.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+  
+  const now = audioCtx.currentTime;
+  
+  switch(type) {
+    case 'correct':
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(523, now);
+      oscillator.frequency.setValueAtTime(659, now + 0.1);
+      oscillator.frequency.setValueAtTime(784, now + 0.2);
+      gainNode.gain.setValueAtTime(0.3, now);
+      gainNode.gain.exponentialDecayTo && gainNode.gain.exponentialDecayTo(0.01, now + 0.4);
+      gainNode.gain.setValueAtTime(0.3, now);
+      gainNode.gain.linearRampToValueAtTime(0.01, now + 0.4);
+      oscillator.start(now);
+      oscillator.stop(now + 0.4);
+      break;
+      
+    case 'wrong':
+      oscillator.type = 'sawtooth';
+      oscillator.frequency.setValueAtTime(300, now);
+      oscillator.frequency.linearRampToValueAtTime(150, now + 0.3);
+      gainNode.gain.setValueAtTime(0.2, now);
+      gainNode.gain.linearRampToValueAtTime(0.01, now + 0.3);
+      oscillator.start(now);
+      oscillator.stop(now + 0.3);
+      setTimeout(() => {
+        const osc2 = audioCtx.createOscillator();
+        const gain2 = audioCtx.createGain();
+        osc2.connect(gain2);
+        gain2.connect(audioCtx.destination);
+        osc2.type = 'square';
+        osc2.frequency.setValueAtTime(200, audioCtx.currentTime);
+        osc2.frequency.linearRampToValueAtTime(100, audioCtx.currentTime + 0.2);
+        gain2.gain.setValueAtTime(0.15, audioCtx.currentTime);
+        gain2.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+        osc2.start(audioCtx.currentTime);
+        osc2.stop(audioCtx.currentTime + 0.2);
+      }, 150);
+      break;
+      
+    case 'click':
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(800, now);
+      oscillator.frequency.exponentialRampToValueAtTime(400, now + 0.05);
+      gainNode.gain.setValueAtTime(0.2, now);
+      gainNode.gain.linearRampToValueAtTime(0.01, now + 0.05);
+      oscillator.start(now);
+      oscillator.stop(now + 0.05);
+      break;
+      
+    case 'win':
+      // 搞笑的胜利音效
+      const notes = [523, 587, 659, 698, 784, 880, 988, 1047];
+      notes.forEach((freq, i) => {
+        setTimeout(() => {
+          const osc = audioCtx.createOscillator();
+          const gain = audioCtx.createGain();
+          osc.connect(gain);
+          gain.connect(audioCtx.destination);
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+          gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+          gain.gain.linearRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+          osc.start(audioCtx.currentTime);
+          osc.stop(audioCtx.currentTime + 0.15);
+        }, i * 80);
+      });
+      return;
+      
+    case 'levelComplete':
+      oscillator.type = 'triangle';
+      oscillator.frequency.setValueAtTime(440, now);
+      oscillator.frequency.setValueAtTime(554, now + 0.1);
+      oscillator.frequency.setValueAtTime(659, now + 0.2);
+      oscillator.frequency.setValueAtTime(880, now + 0.3);
+      gainNode.gain.setValueAtTime(0.25, now);
+      gainNode.gain.linearRampToValueAtTime(0.01, now + 0.5);
+      oscillator.start(now);
+      oscillator.stop(now + 0.5);
+      break;
+
+    case 'tick':
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(880, now);
+      gainNode.gain.setValueAtTime(0.15, now);
+      gainNode.gain.linearRampToValueAtTime(0.001, now + 0.18);
+      oscillator.start(now);
+      oscillator.stop(now + 0.18);
+      break;
+  }
+}
+// PK模式相关变量
+let pkQuestions = [[], []]; // 玩家1和玩家2的题目
+let pkCurrentQuestionIndex = [0, 0]; // 玩家1和玩家2的当前题目索引
+let pkScores = [0, 0]; // 玩家1和玩家2的分数
+let pkTimerInterval = null; // PK模式的计时器
+let pkTimeLeft = 60; // PK模式的剩余时间
+let pkGameStarted = false; // PK游戏是否开始
+let pkPlayerNames = [null, null]; // 匹配成功后的双方用户名（null时显示默认名称）
+let pkMatchCountdownTimer = null; // 匹配成功后的倒计时
+let pkMatchPollTimer = null; // 匹配状态轮询定时器（等待其他设备）
+let pkRoomPollTimer = null; // 对战进度轮询定时器（同步对方进度）
+let pkRoomId = null; // 当前对战房间ID
+let pkOpponentProgress = { score: 0, answered: 0, finished: false }; // 对方实时进度
+let pkOpponentLeft = false; // 对方是否已退出
+let pkMyFinished = false; // 自己是否已完成（答完题或时间到）
+let pkAgreedBankId = null; // 题库协商后双方一致使用的题库ID
+let pkQuestionPages = null; // 本次PK出题使用的标签页数据（可能临时加载自非当前题库）
+let pkBankPollTimer = null; // 题库协商结果轮询定时器
+let pkBankVoted = false; // 本局是否已提交过题库选择
+let pkBankConfig = null; // 双方协商后所选题库的原始配置（用于PK背景渲染）
+let pkLangData = null; // 按双方最终选定题库合并的语言包（用于PK结算提示语）
+// P2P联机码配对（房主/房客）与WebRTC直连隧道
+let pkP2pCode = null;        // 本局P2P联机码（房主生成/房客输入）
+let pkP2pRole = null;        // 本机角色：'host'=房主 | 'guest'=房客
+let pkP2pPollTimer = null;   // P2P状态轮询定时器（等待配对/收取对方信令）
+let pkP2pPc = null;          // RTCPeerConnection（直连隧道）
+let pkP2pDc = null;          // 对局数据通道 DataChannel
+let pkP2pDcOpen = false;     // 直连是否已建立（DataChannel open）
+let pkP2pTunnelStarted = false; // 是否已启动WebRTC建连流程（防止重复创建）
+let pkP2pDescSent = false;   // 本端SDP（offer/answer）是否已发出
+let pkP2pLocalIce = [];      // 本端已收集的ICE候选（SDP发出后随信令补发）
+let pkP2pPendingIce = [];    // 对端SDP未就绪时缓存的对方ICE候选
+// 获取玩家显示名称：优先使用匹配到的用户名，否则显示默认
+function pkDisplayName(i) {
+  if (pkPlayerNames[i]) return pkPlayerNames[i];
+  if (i === 0) return currentPlayer || (langData?.pk?.player1 || "玩家1");
+  return langData?.pk?.player2 || "玩家2";
+}
+// 应用PK界面背景：底色用双方协商题库的主题色，背景图覆盖在上面（网页背景不可用时回退默认题库背景图）
+function pkApplyBackground() {
+  const container = document.getElementById('pkModeContainer');
+  if (!container) return;
+  const DEFAULT_BG = 'resource/background.png';
+  const theme = pkBankConfig && typeof pkBankConfig.themeColor === 'string' && pkBankConfig.themeColor.trim() ? pkBankConfig.themeColor.trim() : null;
+  let conf = normalizeBankBackground(pkBankConfig ? pkBankConfig.background : null);
+  if (conf && conf.kind === 'webpage') conf = null; // 网页无法作为PK背景，回退默认
+  const safe = String(conf ? resolveBankBgSrc(conf.src) : DEFAULT_BG).replace(/["\\\n\r]/g, '');
+  const overlay = conf ? conf.overlay : 0;
+  const shade = overlay > 0 ? 'linear-gradient(rgba(0,0,0,' + overlay + '),rgba(0,0,0,' + overlay + ')), ' : '';
+  container.style.backgroundColor = theme || '#0a0a0a';
+  container.style.backgroundImage = shade + 'url("' + safe + '")';
+  container.style.backgroundSize = 'cover';
+  container.style.backgroundRepeat = 'no-repeat';
+  container.style.backgroundPosition = 'center center';
+}
+// 应用PK按钮主题：背景=双方最终选定题库的主题色，文字与边框=题库文字色（玩家名、分数与边框保持默认不变）
+function pkApplyBtnTheme() {
+  const container = document.getElementById('pkModeContainer');
+  if (!container) return;
+  const theme = pkBankConfig && typeof pkBankConfig.themeColor === 'string' && pkBankConfig.themeColor.trim() ? pkBankConfig.themeColor.trim() : null;
+  if (!theme) return; // 题库未自定义主题色：保持默认按钮样式
+  const text = pkBankConfig && typeof pkBankConfig.textColor === 'string' && pkBankConfig.textColor.trim() ? pkBankConfig.textColor.trim() : '#FFD700';
+  container.style.setProperty('--pk-btn-bg', 'linear-gradient(135deg, ' + theme + ', ' + lightenColor(theme, 0.25) + ')');
+  container.style.setProperty('--pk-btn-color', text);
+  container.style.setProperty('--pk-bg-color', theme);
+}
+// 清除PK按钮主题与背景底色（恢复默认样式）
+function pkClearBtnTheme() {
+  const container = document.getElementById('pkModeContainer');
+  if (!container) return;
+  container.style.removeProperty('--pk-btn-bg');
+  container.style.removeProperty('--pk-btn-color');
+  container.style.removeProperty('--pk-bg-color');
+  container.style.backgroundColor = '#0a0a0a';
+  container.style.backgroundImage = 'linear-gradient(135deg, #0a0a0a 0%, #121212 33%, #1a1a2e 66%, #16213e 100%)';
+  container.style.backgroundSize = '';
+  container.style.backgroundRepeat = '';
+  container.style.backgroundPosition = '';
+}
+// 加载指定题库的合并语言包：基础语言包与题库专属语言包并行请求（Worker线程解析），深合并（用于PK结算提示语按最终题库显示）
+async function pkLoadBankLang(bankId) {
+  const lang = settings.language || 'zh-cn';
+  try {
+    const [base, bankLang] = await Promise.all([
+      fetchJsonInWorker('lang/' + lang + '.json'),
+      fetchJsonInWorker('lang/' + bankId + '-' + lang + '.json').catch(() => null)
+    ]);
+    return deepMergeLang(base, bankLang);
+  } catch (e) {
+    return langData; // 基础语言包加载失败时回退当前语言包
+  }
+}
+// 显示PK模式页面
+function showPKMode() {
+  if (document.getElementById("game") && !document.getElementById("game").classList.contains("hide")) {
+    previousPage = 'game';
+  } else {
+    previousPage = currentPageKey || firstPageKey();
+  }
+
+  document.querySelectorAll('.category-content').forEach(el => el.classList.add('hide'));
+  document.getElementById('game').classList.add('hide');
+  document.getElementById('aboutPage').classList.add('hide');
+  document.getElementById('helpPage').classList.add('hide');
+  document.getElementById('settingsPage').classList.add('hide');
+
+  document.getElementById("navContainer").classList.add("hide");
+  document.getElementById('bankMenu').classList.add('hide');
+  // 显示PK模式页面
+  const pkContainer = document.getElementById('pkModeContainer');
+  pkContainer.classList.remove('hide');
+  pkContainer.style.display = 'flex';
+
+  pkPlayerNames = [currentPlayer, null];
+
+  resetPKGame();
+
+  showPKMatchmaking();
+}
+// 隐藏PK模式页面
+function hidePKMode() {
+  if (pkTimerInterval) {
+    clearInterval(pkTimerInterval);
+    pkTimerInterval = null;
+  }
+
+  if (pkMatchCountdownTimer) {
+    clearTimeout(pkMatchCountdownTimer);
+    pkMatchCountdownTimer = null;
+  }
+  if (pkMatchPollTimer) {
+    clearInterval(pkMatchPollTimer);
+    pkMatchPollTimer = null;
+  }
+  if (pkRoomPollTimer) {
+    clearInterval(pkRoomPollTimer);
+    pkRoomPollTimer = null;
+  }
+  pkStopBankPolling();
+  pkBankVoted = false;
+  pkAgreedBankId = null;
+  pkQuestionPages = null;
+  document.getElementById('pkBankOverlay').classList.add('hide');
+  if (pkRoomId && currentPlayer) {
+    fetch('/api/pk/room/leave', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: pkRoomId, username: currentPlayer })
+    }).catch(() => {});
+  } else if (currentPlayer) {
+    fetch('/api/pk/match/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer })
+    }).catch(() => {});
+  }
+  pkRoomId = null;
+  pkBankConfig = null;
+  pkLangData = null;
+  pkClearBtnTheme();
+  pkP2pTeardown();
+  document.getElementById('pkMatchOverlay').classList.add('hide');
+  document.getElementById('pkMatchHint').classList.remove('hide');
+  document.getElementById('pkReturnBtn').classList.remove('hide');
+  // 隐藏PK模式页面
+  const pkContainer = document.getElementById('pkModeContainer');
+  pkContainer.classList.add('hide');
+  pkContainer.style.display = 'none';
+  
+  document.getElementById("navContainer").classList.remove("hide");
+  // 返回进入PK前所在的标签页
+  const backKey = (previousPage && previousPage !== 'game') ? previousPage : currentPageKey;
+  showCategory(backKey || firstPageKey());
+}
+// PK结算后返回PK初始页面（显示开始按钮，不退出PK界面），并通知服务器离开房间避免残留串台
+function pkLeaveRoomAndReset() {
+  if (pkTimerInterval) {
+    clearInterval(pkTimerInterval);
+    pkTimerInterval = null;
+  }
+  if (pkRoomId && currentPlayer) {
+    fetch('/api/pk/room/leave', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: pkRoomId, username: currentPlayer })
+    }).catch(() => {});
+  }
+  if (pkP2pCode && currentPlayer) {
+    fetch('/api/pk/p2p/leave', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code: pkP2pCode, username: currentPlayer })
+    }).catch(() => {});
+  }
+  pkPlayerNames[1] = null;
+  resetPKGame();
+}
+// 重置PK游戏
+function resetPKGame() {
+  pkScores = [0, 0];
+  // 重置玩家区域
+  const leftPlayer = document.getElementById('pkLeftPlayer');
+  const rightPlayer = document.getElementById('pkRightPlayer');
+
+  if (pkMatchCountdownTimer) {
+    clearTimeout(pkMatchCountdownTimer);
+    pkMatchCountdownTimer = null;
+  }
+  if (pkMatchPollTimer) {
+    clearInterval(pkMatchPollTimer);
+    pkMatchPollTimer = null;
+  }
+  if (pkRoomPollTimer) {
+    clearInterval(pkRoomPollTimer);
+    pkRoomPollTimer = null;
+  }
+  pkStopBankPolling();
+  pkBankVoted = false;
+  pkAgreedBankId = null;
+  pkQuestionPages = null;
+  pkBankConfig = null;
+  pkLangData = null;
+  pkClearBtnTheme();
+  pkP2pTeardown();
+  pkRoomId = null;
+  pkOpponentProgress = { score: 0, answered: 0, finished: false };
+  pkOpponentLeft = false;
+  pkMyFinished = false;
+  document.getElementById('pkMatchOverlay').classList.add('hide');
+  document.getElementById('pkBankOverlay').classList.add('hide');
+  document.getElementById('pkMatchHint').classList.remove('hide');
+
+  leftPlayer.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h3 style="color:#DC143C;font-size:20px;font-weight:bold;text-shadow:0 2px 4px rgba(220,20,60,0.3);">${pkDisplayName(0)}</h3>
+      <div class="pk-score" id="pkLeftScore" style="font-size:28px;font-weight:bold;color:#DC143C;text-shadow:0 2px 4px rgba(220,20,60,0.3);">0</div>
+    </div>
+    <div class="progress-bar" style="margin-bottom:20px;height:10px;">
+      <div class="progress-fill" id="pkLeftProgress" style="width:0%;background:linear-gradient(90deg, #DC143C, #FF6347);box-shadow:0 0 10px rgba(220,20,60,0.5);"></div>
+    </div>
+    <div class="question" id="pkLeftQuestion" style="flex:1;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:bold;color:#ffffff;padding:16px;text-align:center;">${langData?.pk?.prepare || "准备开始"}</div>
+    <div class="options" id="pkLeftOptions"></div>
+  `;
+
+  rightPlayer.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h3 style="color:#1E90FF;font-size:20px;font-weight:bold;text-shadow:0 2px 4px rgba(30,144,255,0.3);">${pkDisplayName(1)}</h3>
+      <div class="pk-score" id="pkRightScore" style="font-size:28px;font-weight:bold;color:#1E90FF;text-shadow:0 2px 4px rgba(30,144,255,0.3);">0</div>
+    </div>
+    <div class="progress-bar" style="margin-bottom:20px;height:10px;">
+      <div class="progress-fill" id="pkRightProgress" style="width:0%;background:linear-gradient(90deg, #1E90FF, #4169E1);box-shadow:0 0 10px rgba(30,144,255,0.5);"></div>
+    </div>
+    <div class="question" id="pkRightQuestion" style="flex:1;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:bold;color:#ffffff;padding:16px;text-align:center;">${langData?.pk?.prepare || "准备开始"}</div>
+    <div class="options" id="pkRightOptions"></div>
+  `;
+  
+  pkTimeLeft = 60;
+  document.getElementById('pkTimer').innerHTML = `<span>⏰</span><span>${langData?.pk?.time || "剩余时间："}60s</span>`;
+  document.getElementById('pkTimerContainer').style.marginTop = '0px';
+  
+  pkCurrentQuestionIndex = [0, 0];
+  pkQuestions = [[], []];
+  pkGameStarted = false;
+  
+  document.getElementById('pkStartBtn').style.display = 'block';
+}
+// 生成PK模式的题目（从指定题库所有标签页中随机选择20个不同的题目，作为本机玩家的题）
+function generatePKQuestions(pages) {
+  pages = pages || bankPages;
+  // 收集指定题库的所有题目
+  const allQuestions = [];
+  pages.forEach(page => {
+    page.levels.forEach(level => {
+      level.forEach(question => {
+        allQuestions.push(question);
+      });
+    });
+  });
+  // 随机选择20个题目（题库不足20时全部使用）
+  const myQuestions = [];
+  const questionsCopy = JSON.parse(JSON.stringify(allQuestions));
+  while (myQuestions.length < 20 && questionsCopy.length > 0) {
+    const randomIndex = Math.floor(Math.random() * questionsCopy.length);
+    myQuestions.push(questionsCopy[randomIndex]);
+    questionsCopy.splice(randomIndex, 1);
+  }
+
+  return myQuestions;
+}
+// 显示匹配队列界面：加入服务器匹配队列，等待其他设备的玩家匹配
+async function showPKMatchmaking() {
+  pkStopBankPolling();
+  pkBankVoted = false;
+  pkAgreedBankId = null;
+  pkQuestionPages = null;
+  pkBankConfig = currentBank;
+  pkApplyBackground();
+  pkApplyBtnTheme();
+  document.getElementById('pkBankOverlay').classList.add('hide');
+
+  pkPlayerNames = [currentPlayer, null];
+  document.getElementById('pkStartBtn').style.display = 'none';
+
+  document.getElementById('pkMatchP1Name').textContent = pkDisplayName(0);
+  // 玩家2卡片恢复等待状态
+  const p2Card = document.getElementById('pkMatchP2Card');
+  p2Card.classList.add('waiting');
+  document.getElementById('pkMatchP2Avatar').textContent = '⏳';
+  document.getElementById('pkMatchP2Name').textContent = langData?.pk?.matchWaiting || "等待对手加入...";
+
+  document.getElementById('pkMatchStatus').innerHTML = `<span>${langData?.pk?.matchSearching || "正在匹配对手"}</span><span class="pk-dots"></span>`;
+  document.getElementById('pkMatchHint').textContent = langData?.pk?.matchHint || "请在另一台设备上打开本页面，进入PK模式并点击开始游戏，即可自动匹配";
+  document.getElementById('pkMatchCancelBtn').classList.remove('hide');
+  document.getElementById('pkMatchError').textContent = '';
+  pkP2pApplyLang();
+  pkP2pResetUI();
+  document.getElementById('pkMatchOverlay').classList.remove('hide');
+  document.getElementById('pkReturnBtn').classList.add('hide');
+
+  if (!currentPlayer) {
+    document.getElementById('pkMatchError').textContent = langData?.pk?.matchNeedLogin || "请先登录后再匹配";
+    document.getElementById('pkMatchCancelBtn').classList.add('hide');
+    document.getElementById('pkP2pMoreWrap').classList.add('hide');
+    return;
+  }
+
+  try {
+    const r = await pkApi('/api/pk/match/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer, bankId: currentBankId })
+    });
+    if (!r.success) throw new Error(r.error || 'join failed');
+    if (r.status === 'matched') {
+      pkOnMatched(r.roomId, r.opponent, r);
+    } else {
+      pkStartMatchPolling();
+    }
+  } catch (e) {
+    document.getElementById('pkMatchError').textContent = langData?.pk?.matchServerError || "匹配服务不可用，请确认服务器已启动";
+  }
+}
+// 服务器API请求封装
+async function pkApi(url, options) {
+  const res = await fetch(url, options);
+  return await res.json();
+}
+// 轮询匹配状态（每1.5秒一次，同时作为队列心跳）
+function pkStartMatchPolling() {
+  pkStopMatchPolling();
+  pkMatchPollTimer = setInterval(async () => {
+    if (!currentPlayer || pkRoomId) { pkStopMatchPolling(); return; }
+    try {
+      const r = await pkApi('/api/pk/match/poll?username=' + encodeURIComponent(currentPlayer));
+      if (r.status === 'matched') {
+        if (pkRoomId && pkRoomId !== r.roomId) return;
+        pkStopMatchPolling();
+        pkOnMatched(r.roomId, r.opponent, r);
+      }
+    } catch (e) { /* 网络抖动忽略，下轮重试 */ }
+  }, 1500);
+}
+
+function pkStopMatchPolling() {
+  if (pkMatchPollTimer) {
+    clearInterval(pkMatchPollTimer);
+    pkMatchPollTimer = null;
+  }
+}
+// 取消匹配：退出公开匹配队列/P2P配对房间并回到PK初始页
+async function pkCancelMatch() {
+  pkStopMatchPolling();
+  pkStopP2pPolling();
+  document.getElementById('pkMatchOverlay').classList.add('hide');
+  if (currentPlayer && pkP2pCode) {
+    try {
+      await pkApi('/api/pk/p2p/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: pkP2pCode, username: currentPlayer })
+      });
+    } catch (e) { /* 忽略 */ }
+  } else if (currentPlayer) {
+    try {
+      await pkApi('/api/pk/match/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: currentPlayer })
+      });
+    } catch (e) { /* 忽略 */ }
+  }
+  pkP2pTeardown();
+  hidePKMode();
+}
+// 应用P2P配对界面的多语言文案
+function pkP2pApplyLang() {
+  const pk = langData?.pk || {};
+  document.getElementById('pkP2pToggleText').textContent = pk.moreWays || "更多联机方式";
+  document.getElementById('pkP2pHostBtn').textContent = pk.beHost || "我想当房主";
+  document.getElementById('pkP2pGuestBtn').textContent = pk.beGuest || "我想当房客";
+  document.getElementById('pkP2pCodeLabel').textContent = pk.p2pCodeLabel || "联机码";
+  document.getElementById('pkP2pWaitingText').innerHTML = `<span>${pk.p2pWaitingGuest || "等待房客加入..."}</span><span class="pk-dots"></span>`;
+  document.getElementById('pkP2pCodeHint').textContent = pk.p2pCodeHint || "请将联机码告知对方，对方选择「我想当房客」并输入此码即可配对";
+  document.getElementById('pkP2pEnterLabel').textContent = pk.p2pEnterCode || "输入邀请码";
+  document.getElementById('pkP2pJoinBtn').textContent = pk.p2pJoinBtn || "确认加入";
+}
+// 重置P2P配对界面到初始状态（展开菜单收起、房主/房客区域隐藏）
+function pkP2pResetUI() {
+  document.getElementById('pkP2pMoreWrap').classList.remove('hide');
+  document.getElementById('pkP2pMenu').classList.add('hide');
+  document.getElementById('pkP2pToggleArrow').textContent = '▾';
+  document.getElementById('pkP2pHostArea').classList.add('hide');
+  document.getElementById('pkP2pGuestArea').classList.add('hide');
+  document.getElementById('pkP2pCodeInput').value = '';
+}
+// 收起/展开"更多联机方式"菜单
+function pkToggleP2pMenu() {
+  const menu = document.getElementById('pkP2pMenu');
+  const arrow = document.getElementById('pkP2pToggleArrow');
+  if (menu.classList.contains('hide')) {
+    menu.classList.remove('hide');
+    arrow.textContent = '▴';
+  } else {
+    menu.classList.add('hide');
+    arrow.textContent = '▾';
+  }
+}
+// 隐藏配对相关UI（配对成功进入倒计时/题库协商时调用）
+function pkP2pHidePairingUI() {
+  document.getElementById('pkP2pMoreWrap').classList.add('hide');
+  document.getElementById('pkP2pHostArea').classList.add('hide');
+  document.getElementById('pkP2pGuestArea').classList.add('hide');
+}
+// 进入P2P配对流程前：若此前已被意外公开匹配（如双方几乎同时进入匹配队列），先离开旧房间避免串台
+async function pkP2pAbandonPreviousRoom() {
+  if (pkRoomId && currentPlayer) {
+    try {
+      await pkApi('/api/pk/room/leave', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: pkRoomId, username: currentPlayer })
+      });
+    } catch (e) { /* 忽略 */ }
+  }
+  pkStopBankPolling();
+  pkBankVoted = false;
+  pkRoomId = null;
+  pkPlayerNames[1] = null;
+  document.getElementById('pkBankOverlay').classList.add('hide');
+}
+// 房主流：先退出公开匹配队列，登记为房主并展示6位联机码，轮询等待房客加入
+async function pkP2pBeHost() {
+  if (!currentPlayer) return;
+  pkStopMatchPolling();
+  try {
+    await pkApi('/api/pk/match/cancel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer })
+    });
+  } catch (e) { /* 忽略 */ }
+  await pkP2pAbandonPreviousRoom();
+  pkP2pRole = 'host';
+  document.getElementById('pkP2pMoreWrap').classList.add('hide');
+  document.getElementById('pkP2pHostArea').classList.remove('hide');
+  document.getElementById('pkMatchError').textContent = '';
+  try {
+    const r = await pkApi('/api/pk/p2p/host', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer, bankId: currentBankId })
+    });
+    if (!r.success) throw new Error(r.error || 'host failed');
+    pkP2pCode = r.code;
+    document.getElementById('pkP2pCodeText').textContent = r.code;
+    pkP2pStartPolling();
+  } catch (e) {
+    document.getElementById('pkP2pHostArea').classList.add('hide');
+    document.getElementById('pkP2pMoreWrap').classList.remove('hide');
+    document.getElementById('pkMatchError').textContent = langData?.pk?.matchServerError || "匹配服务不可用，请确认服务器已启动";
+  }
+}
+// 房客流：先退出公开匹配队列，显示联机码输入框
+async function pkP2pBeGuest() {
+  if (!currentPlayer) return;
+  pkStopMatchPolling();
+  try {
+    await pkApi('/api/pk/match/cancel', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer })
+    });
+  } catch (e) { /* 忽略 */ }
+  await pkP2pAbandonPreviousRoom();
+  pkP2pRole = 'guest';
+  document.getElementById('pkP2pMoreWrap').classList.add('hide');
+  document.getElementById('pkP2pHostArea').classList.add('hide');
+  document.getElementById('pkP2pGuestArea').classList.remove('hide');
+  document.getElementById('pkMatchError').textContent = '';
+  const input = document.getElementById('pkP2pCodeInput');
+  input.value = '';
+  input.focus();
+}
+// 房客输入框：自动转大写、去除非法字符、限6位
+function pkP2pCodeInputChanged() {
+  const input = document.getElementById('pkP2pCodeInput');
+  input.value = input.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+}
+// 房客确认加入：凭联机码配对，成功后进入与公开匹配相同的开局流程
+async function pkP2pJoinByCode() {
+  const input = document.getElementById('pkP2pCodeInput');
+  const code = input.value.trim().toUpperCase();
+  if (code.length !== 6) {
+    document.getElementById('pkMatchError').textContent = langData?.pk?.p2pCodeInvalid || "联机码无效";
+    return;
+  }
+  try {
+    const r = await pkApi('/api/pk/p2p/join', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: currentPlayer, code, bankId: currentBankId })
+    });
+    if (!r.success) {
+      document.getElementById('pkMatchError').textContent = r.error || (langData?.pk?.p2pCodeInvalid || "联机码无效");
+      return;
+    }
+    pkP2pCode = code;
+    pkP2pStartTunnel('guest');
+    pkP2pStartPolling();
+    pkOnMatched(r.roomId, r.opponent, r);
+  } catch (e) {
+    document.getElementById('pkMatchError').textContent = langData?.pk?.matchServerError || "匹配服务不可用，请确认服务器已启动";
+  }
+}
+// P2P状态轮询（1.2秒）：房主等待配对、双方收取对方WebRTC信令，同时作为P2P房间心跳
+function pkP2pStartPolling() {
+  pkStopP2pPolling();
+  pkP2pPollTimer = setInterval(async () => {
+    if (!pkP2pCode || !currentPlayer) { pkStopP2pPolling(); return; }
+    try {
+      const r = await pkApi('/api/pk/p2p/state?code=' + encodeURIComponent(pkP2pCode) + '&username=' + encodeURIComponent(currentPlayer));
+      if (!r.success || r.status === 'gone') {
+        pkStopP2pPolling();
+        if (!pkGameStarted) pkP2pOnGone();
+        return;
+      }
+      if (r.status === 'matched' && !pkRoomId) {
+        pkP2pStartTunnel('host');
+        pkOnMatched(r.roomId, r.guest, r);
+      }
+      if (Array.isArray(r.signals)) r.signals.forEach(m => pkP2pOnSignal(m));
+    } catch (e) { /* 网络抖动忽略，下轮重试 */ }
+  }, 1200);
+}
+
+function pkStopP2pPolling() {
+  if (pkP2pPollTimer) {
+    clearInterval(pkP2pPollTimer);
+    pkP2pPollTimer = null;
+  }
+}
+// 对方已离开/配对房间已删除（开局前）：提示后返回主页面
+function pkP2pOnGone() {
+  pkP2pTeardown();
+  alert(langData?.pk?.opponentLeft || "对方已退出对战");
+  hidePKMode();
+}
+// 启动建连：房主创建数据通道并发起Offer；房客只创建连接等待对方的Offer
+function pkP2pStartTunnel(role) {
+  if (pkP2pTunnelStarted || typeof RTCPeerConnection === 'undefined') return;
+  pkP2pTunnelStarted = true;
+  pkP2pDescSent = false;
+  pkP2pLocalIce = [];
+  pkP2pPendingIce = [];
+  try {
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pkP2pPc = pc;
+    pc.onicecandidate = e => {
+      if (!e.candidate) return;
+      pkP2pLocalIce.push(e.candidate);
+      if (pkP2pDescSent) pkP2pSendSignal({ t: 'ice', c: e.candidate });
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') pkP2pOnDcLost();
+    };
+    if (role === 'host') {
+      // 房主：创建数据通道并发起Offer，等待ICE收集完成后发送
+      const dc = pc.createDataChannel('pk');
+      pkP2pWireDc(dc);
+      pc.createOffer()
+        .then(offer => pc.setLocalDescription(offer))
+        .then(() => pkP2pWaitIce(pc))
+        .then(() => {
+          pkP2pSendSignal({ t: 'offer', sdp: pc.localDescription });
+          pkP2pFlushLocalIce();
+        })
+        .catch(() => pkP2pOnDcLost());
+    } else {
+      pc.ondatachannel = e => pkP2pWireDc(e.channel);
+    }
+  } catch (e) {
+    pkP2pOnDcLost();
+  }
+}
+// 绑定数据通道事件：open后实时同步进度，close/error自动回退服务器轮询
+function pkP2pWireDc(dc) {
+  pkP2pDc = dc;
+  dc.onopen = () => {
+    pkP2pDcOpen = true;
+    pkP2pUpdateBadge(true);
+    pkStopP2pPolling();
+    if (pkGameStarted) pkStartRoomPolling();
+  };
+  dc.onclose = () => pkP2pOnDcLost();
+  dc.onerror = () => pkP2pOnDcLost();
+  dc.onmessage = e => {
+    try {
+      const m = JSON.parse(e.data);
+      if (m && m.t === 'p') pkP2pOnProgress(m);
+    } catch (err) { /* 忽略非法消息 */ }
+  };
+}
+// 等待ICE收集完成（complete或2秒超时即继续，避免候选收集过久拖延建连）
+function pkP2pWaitIce(pc) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const done = () => { clearTimeout(timer); pc.removeEventListener('icegatheringstatechange', check); resolve(); };
+    const check = () => { if (pc.iceGatheringState === 'complete') done(); };
+    const timer = setTimeout(done, 2000);
+    pc.addEventListener('icegatheringstatechange', check);
+  });
+}
+// SDP发出后，把收集到的本端ICE候选逐条补发
+function pkP2pFlushLocalIce() {
+  pkP2pDescSent = true;
+  pkP2pLocalIce.forEach(c => pkP2pSendSignal({ t: 'ice', c }));
+  pkP2pLocalIce = [];
+}
+// 通过服务器信令接口发送WebRTC消息
+function pkP2pSendSignal(data) {
+  if (!pkP2pCode || !currentPlayer) return;
+  fetch('/api/pk/p2p/signal', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: pkP2pCode, from: currentPlayer, data })
+  }).catch(() => {});
+}
+// 处理对方信令：房客应答Offer、双方交换ICE候选（对端SDP未就绪时先缓存候选）
+async function pkP2pOnSignal(msg) {
+  if (!msg || !pkP2pPc) return;
+  try {
+    if (msg.t === 'offer') {
+      await pkP2pPc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      pkP2pFlushPendingIce();
+      const answer = await pkP2pPc.createAnswer();
+      await pkP2pPc.setLocalDescription(answer);
+      await pkP2pWaitIce(pkP2pPc);
+      pkP2pSendSignal({ t: 'answer', sdp: pkP2pPc.localDescription });
+      pkP2pFlushLocalIce();
+    } else if (msg.t === 'answer') {
+      if (pkP2pPc.signalingState === 'have-local-offer') {
+        await pkP2pPc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        pkP2pFlushPendingIce();
+      }
+    } else if (msg.t === 'ice' && msg.c) {
+      if (pkP2pPc.remoteDescription) {
+        try { await pkP2pPc.addIceCandidate(new RTCIceCandidate(msg.c)); } catch (e) { /* 无效候选忽略 */ }
+      } else {
+        pkP2pPendingIce.push(msg.c);
+      }
+    }
+  } catch (e) { /* 信令处理失败忽略 */ }
+}
+// 对端SDP就绪后补加缓存的ICE候选
+function pkP2pFlushPendingIce() {
+  pkP2pPendingIce.forEach(c => { try { pkP2pPc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { /* 忽略 */ } });
+  pkP2pPendingIce = [];
+}
+// 通过直连通道发送消息（通道未open时为no-op，不影响服务器回退链路）
+function pkP2pSend(obj) {
+  if (pkP2pDc && pkP2pDc.readyState === 'open') {
+    try { pkP2pDc.send(JSON.stringify(obj)); } catch (e) { /* 忽略 */ }
+  }
+}
+// 收到对方直连进度消息：更新对方进度并刷新右侧显示（与服务器轮询共用渲染逻辑）
+function pkP2pOnProgress(m) {
+  pkOpponentProgress = { score: m.score | 0, answered: m.answered | 0, finished: !!m.finished };
+  pkOpponentLeft = false;
+  pkRenderOpponentProgress();
+  if (pkOpponentProgress.finished) pkMaybeEndGame(false);
+}
+// 直连断开/失败：回退服务器轮询（恢复1.5秒快速轮询，保证功能等价）
+function pkP2pOnDcLost() {
+  if (!pkP2pDcOpen && !pkP2pDc) return;
+  pkP2pDcOpen = false;
+  pkP2pDc = null;
+  pkP2pUpdateBadge(false);
+  if (pkGameStarted && pkRoomId) pkStartRoomPolling();
+}
+// 更新直连状态标识（仅P2P对局显示：直连已建立/服务器中转）
+function pkP2pUpdateBadge(on) {
+  const badge = document.getElementById('pkP2pBadge');
+  if (!badge || !pkP2pRole) return;
+  badge.textContent = on ? (langData?.pk?.p2pDirectOn || "直连已建立") : (langData?.pk?.p2pDirectOff || "服务器中转");
+  badge.classList.toggle('on', !!on);
+  badge.classList.remove('hide');
+}
+// 清理P2P配对与直连隧道状态（幂等：重复调用无副作用）
+function pkP2pTeardown() {
+  pkStopP2pPolling();
+  if (pkP2pDc) {
+    try { pkP2pDc.onclose = null; pkP2pDc.onerror = null; pkP2pDc.onmessage = null; pkP2pDc.close(); } catch (e) { /* 忽略 */ }
+  }
+  if (pkP2pPc) {
+    try { pkP2pPc.onconnectionstatechange = null; pkP2pPc.onicecandidate = null; pkP2pPc.close(); } catch (e) { /* 忽略 */ }
+  }
+  pkP2pPc = null;
+  pkP2pDc = null;
+  pkP2pDcOpen = false;
+  pkP2pTunnelStarted = false;
+  pkP2pDescSent = false;
+  pkP2pLocalIce = [];
+  pkP2pPendingIce = [];
+  pkP2pCode = null;
+  pkP2pRole = null;
+  pkP2pResetUI();
+  document.getElementById('pkP2pBadge').classList.add('hide');
+}
+// 匹配成功：显示对方用户名；双方题库一致直接倒计时开始，不一致则进入双方选题库协商
+function pkOnMatched(roomId, opponent, info) {
+  if (pkRoomId && pkRoomId !== roomId) return; // 过期匹配响应：忽略，避免串台到旧房间
+  pkRoomId = roomId;
+  pkPlayerNames[1] = opponent;
+  pkOpponentProgress = { score: 0, answered: 0, finished: false };
+  pkOpponentLeft = false;
+  pkMyFinished = false;
+
+  document.getElementById('pkMatchP2Card').classList.remove('waiting');
+  document.getElementById('pkMatchP2Avatar').textContent = '👤';
+  document.getElementById('pkMatchP2Name').textContent = opponent;
+
+  pkP2pHidePairingUI();
+  if (pkP2pRole) pkP2pUpdateBadge(pkP2pDcOpen);
+
+  if (info && info.bankStatus === 'select') {
+    showPKBankSelect(info);
+  } else {
+    pkAgreedBankId = (info && info.bankId) || currentBankId;
+    pkQuestionPages = bankPages;
+    pkBankConfig = currentBank;
+    pkLangData = langData; // 当前题库语言包已合并过该题库专属文案
+    pkApplyBackground();
+    pkApplyBtnTheme();
+    pkBeginCountdown();
+  }
+}
+// 匹配成功后的3秒倒计时，随后双方同时开始答题
+function pkBeginCountdown() {
+  document.getElementById('pkBankOverlay').classList.add('hide');
+  document.getElementById('pkMatchOverlay').classList.remove('hide');
+  document.getElementById('pkMatchHint').classList.add('hide');
+  document.getElementById('pkMatchCancelBtn').classList.add('hide');
+  const status = document.getElementById('pkMatchStatus');
+  const successText = langData?.pk?.matchSuccess || "匹配成功！";
+  const startInText = langData?.pk?.matchStartIn || "{{s}} 秒后开始";
+  let count = 3;
+  const tick = () => {
+    if (count > 0) {
+      status.innerHTML = `<div class="pk-match-success">✓ ${successText}</div><div class="pk-match-count">${count}</div><div>${startInText.replace("{{s}}", count)}</div>`;
+      count--;
+      pkMatchCountdownTimer = setTimeout(tick, 1000);
+    } else {
+      pkMatchCountdownTimer = null;
+      document.getElementById('pkMatchOverlay').classList.add('hide');
+      document.getElementById('pkReturnBtn').classList.remove('hide');
+      document.querySelector('#pkLeftPlayer h3').textContent = pkDisplayName(0);
+      document.querySelector('#pkRightPlayer h3').textContent = pkDisplayName(1);
+      startPKGame();
+    }
+  };
+  tick();
+}
+// 显示双方选题库界面：列出服务器上的所有题库供本机选择
+function showPKBankSelect(info) {
+  const ov = document.getElementById('pkBankOverlay');
+  const titleEl = document.getElementById('pkBankTitle');
+  const promptEl = document.getElementById('pkBankPrompt');
+  const statusEl = document.getElementById('pkBankStatus');
+  titleEl.textContent = langData?.pk?.bankSelectTitle || "双方题库不一致";
+  const myBankName = (bankList.find(b => b.id === info.myBank) || {}).name || info.myBank || '?';
+  const opBankName = (bankList.find(b => b.id === info.opponentBank) || {}).name || info.opponentBank || '?';
+  promptEl.textContent = (langData?.pk?.bankSelectPrompt || "你与对手当前使用的题库不同，请双方各选择一个相同的题库开始PK")
+    .replace('{{my}}', myBankName).replace('{{opponent}}', opBankName);
+  statusEl.textContent = '';
+
+  const list = document.getElementById('pkBankList');
+  list.innerHTML = '';
+  bankList.forEach(b => {
+    const btn = document.createElement('button');
+    btn.className = 'pk-bank-option';
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = b.name;
+    const idSpan = document.createElement('span');
+    idSpan.className = 'pk-bank-opt-id';
+    idSpan.textContent = b.id;
+    btn.appendChild(nameSpan);
+    btn.appendChild(idSpan);
+    btn.onclick = () => { playSound('click'); pkSubmitBank(b.id); };
+    list.appendChild(btn);
+  });
+  ov.classList.remove('hide');
+}
+// 提交本机题库选择，并开始轮询对方的选择结果
+async function pkSubmitBank(bankId) {
+  if (pkBankVoted || !pkRoomId) return;
+  pkBankVoted = true;
+  document.querySelectorAll('#pkBankList .pk-bank-option').forEach(b => { b.disabled = true; });
+  const statusEl = document.getElementById('pkBankStatus');
+  statusEl.textContent = langData?.pk?.bankSelectWaiting || "已提交选择，等待对手选择...";
+  try {
+    const r = await pkApi('/api/pk/room/bank', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: pkRoomId, username: currentPlayer, bankId })
+    });
+    if (!r.success) throw new Error(r.error || 'vote failed');
+    pkStartBankPolling();
+  } catch (e) {
+    pkBankVoted = false;
+    document.querySelectorAll('#pkBankList .pk-bank-option').forEach(b => { b.disabled = false; });
+    statusEl.textContent = langData?.pk?.matchServerError || "匹配服务不可用，请确认服务器已启动";
+  }
+}
+// 轮询题库协商结果：agreed 一致开始 / mismatch 不一致终止 / 对方退出则终止
+function pkStartBankPolling() {
+  pkStopBankPolling();
+  pkBankPollTimer = setInterval(async () => {
+    if (!pkRoomId || !currentPlayer) { pkStopBankPolling(); return; }
+    try {
+      const r = await pkApi('/api/pk/room/state?roomId=' + encodeURIComponent(pkRoomId) + '&username=' + encodeURIComponent(currentPlayer));
+      if (!r.success) {
+        pkAbortBeforeStart(langData?.pk?.bankSelectOpponentLeft || "对方已退出，题库协商终止");
+        return;
+      }
+      if (r.opponentLeft) {
+        pkAbortBeforeStart(langData?.pk?.bankSelectOpponentLeft || "对方已退出，题库协商终止");
+        return;
+      }
+      const statusEl = document.getElementById('pkBankStatus');
+      if (r.bankStatus === 'agreed') {
+        pkStopBankPolling();
+        await pkPrepareAgreedBank(r.bankId);
+      } else if (r.bankStatus === 'mismatch') {
+        pkStopBankPolling();
+        pkAbortBeforeStart(langData?.pk?.bankSelectMismatch || "双方选择的题库不一致，PK终止");
+      } else if (statusEl && !r.opponentVoted) {
+        statusEl.textContent = langData?.pk?.bankSelectWaiting || "已提交选择，等待对手选择...";
+      }
+    } catch (e) { /* 网络抖动忽略，下轮重试 */ }
+  }, 1200);
+}
+
+function pkStopBankPolling() {
+  if (pkBankPollTimer) {
+    clearInterval(pkBankPollTimer);
+    pkBankPollTimer = null;
+  }
+}
+// 协商一致：若所选题库不是当前题库则临时加载（不改变玩家当前题库），随后倒计时开局
+async function pkPrepareAgreedBank(bankId) {
+  if (!bankId) {
+    pkAbortBeforeStart(langData?.pk?.bankSelectMismatch || "双方选择的题库不一致，PK终止");
+    return;
+  }
+  if (bankId === currentBankId) {
+    pkAgreedBankId = bankId;
+    pkQuestionPages = bankPages;
+    pkBankConfig = currentBank;
+    pkLangData = langData; // 当前题库语言包已合并过该题库专属文案
+  } else {
+    try {
+      const resp = await fetch('/data/' + bankId + '.json');
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const data = await resp.json();
+      pkAgreedBankId = bankId;
+      pkQuestionPages = normalizeBankPages(data);
+      pkBankConfig = data;
+      pkLangData = await pkLoadBankLang(bankId);
+    } catch (e) {
+      pkAbortBeforeStart(langData?.pk?.bankLoadFailed || "题库加载失败，PK终止");
+      return;
+    }
+  }
+  pkApplyBackground();
+  pkApplyBtnTheme();
+  pkBeginCountdown();
+}
+// 开局前终止PK（题库协商不一致或对方退出）：提示后本机自动退出
+function pkAbortBeforeStart(reason) {
+  pkStopBankPolling();
+  pkBankVoted = false;
+  document.getElementById('pkBankOverlay').classList.add('hide');
+  document.getElementById('pkMatchOverlay').classList.add('hide');
+  alert(reason);
+  hidePKMode();
+}
+// 取消选题库：退出房间返回主页面（会通知对方，对方自动终止）
+function pkCancelBankSelect() {
+  pkStopBankPolling();
+  pkBankVoted = false;
+  hidePKMode();
+}
+// 开始PK游戏：左侧为本机答题区，右侧显示对方实时进度
+function startPKGame() {
+  pkQuestions[0] = generatePKQuestions(pkQuestionPages || bankPages);
+  pkQuestions[1] = [];
+  pkCurrentQuestionIndex = [0, 0];
+  pkScores = [0, 0];
+
+  document.getElementById('pkStartBtn').style.display = 'none';
+
+  document.getElementById('pkTimerContainer').style.marginTop = '-30px';
+
+  pkGameStarted = true;
+  pkMyFinished = false;
+
+  showPKQuestion();
+
+  startPKTimer();
+
+  pkStartRoomPolling();
+}
+// 显示PK题目（仅渲染本机玩家的题目区）
+function showPKQuestion() {
+  if (pkCurrentQuestionIndex[0] >= pkQuestions[0].length) {
+    return; // 已完成，由 handlePKAnswer 处理等待状态
+  }
+
+  const leftQuestion = pkQuestions[0][pkCurrentQuestionIndex[0]];
+  document.getElementById('pkLeftQuestion').textContent = leftQuestion.q;
+  // 生成选项
+  const leftOptions = [...leftQuestion.answers, ...leftQuestion.distractors];
+
+  for (let i = leftOptions.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [leftOptions[i], leftOptions[j]] = [leftOptions[j], leftOptions[i]];
+  }
+  // 显示左侧选项
+  const leftOptionsContainer = document.getElementById('pkLeftOptions');
+  leftOptionsContainer.innerHTML = '';
+  leftOptionsContainer.style.display = 'grid';
+  leftOptionsContainer.style.gridTemplateColumns = '1fr';
+  leftOptionsContainer.style.gap = '10px';
+  leftOptionsContainer.style.margin = '20px 0';
+  leftOptions.forEach((opt, index) => {
+    const button = document.createElement('button');
+    button.className = 'opt';
+    button.textContent = opt;
+    button.onclick = () => handlePKAnswer(0, opt, leftQuestion);
+    button.style.padding = '14px';
+    button.style.border = '2px solid #1e3a8a';
+    button.style.borderRadius = '10px';
+    button.style.background = '#1e3a8a';
+    button.style.color = '#ffffff';
+    button.style.fontSize = '17px';
+    button.style.cursor = 'pointer';
+    button.style.transition = 'all 0.3s cubic-bezier(0.4,0,0.2,1)';
+    button.style.position = 'relative';
+    button.style.overflow = 'hidden';
+    leftOptionsContainer.appendChild(button);
+  });
+}
+// 处理PK模式的答题
+function handlePKAnswer(playerIndex, answer, question) {
+  if (!pkGameStarted || pkMyFinished) return;
+
+  const isCorrect = question.answers.includes(answer);
+
+  if (isCorrect) {
+    pkScores[0]++;
+    playSound('correct');
+  } else {
+    if (pkScores[0] > 0) {
+      pkScores[0]--;
+    }
+    playSound('wrong');
+  }
+
+  document.getElementById('pkLeftScore').textContent = pkScores[0];
+  // 更新进度条
+  const progress = ((pkCurrentQuestionIndex[0] + 1) / pkQuestions[0].length) * 100;
+  document.getElementById('pkLeftProgress').style.width = progress + '%';
+  // 为答案按钮添加正确/错误样式
+  const optionsContainer = document.getElementById('pkLeftOptions');
+  const buttons = optionsContainer.querySelectorAll('button');
+  buttons.forEach(button => {
+    if (question.answers.includes(button.textContent)) {
+      button.style.background = 'linear-gradient(135deg,#00c853 0%,#69f0ae 100%)';
+      button.style.borderColor = '#00c853';
+      button.style.color = '#fff';
+      button.style.fontWeight = 'bold';
+      button.style.boxShadow = '0 4px 20px rgba(0,200,83,0.4)';
+      button.style.animation = 'bounce 0.5s ease';
+    } else if (button.textContent === answer) {
+      button.style.background = 'linear-gradient(135deg,#ff5252 0%,#ff867f 100%)';
+      button.style.borderColor = '#ff5252';
+      button.style.color = '#fff';
+      button.style.fontWeight = 'bold';
+      button.style.boxShadow = '0 4px 20px rgba(255,82,82,0.4)';
+      button.style.animation = 'shake 0.5s ease';
+    }
+    button.disabled = true;
+  });
+
+  pkCurrentQuestionIndex[0]++;
+
+  if (pkCurrentQuestionIndex[0] >= pkQuestions[0].length) {
+    pkMyFinished = true;
+  }
+
+  pkReportProgress(pkMyFinished);
+
+  setTimeout(() => {
+    if (pkMyFinished) {
+      document.getElementById('pkLeftQuestion').textContent = langData?.pk?.selfDone || "已完成所有题目，等待对方...";
+      document.getElementById('pkLeftOptions').innerHTML = '';
+      pkMaybeEndGame(false);
+    } else {
+      showPKQuestion();
+    }
+  }, 1000);
+}
+// 上报本机对战进度到服务器（同时作为房间心跳）
+function pkReportProgress(finished) {
+  if (!pkRoomId || !currentPlayer) return;
+  pkP2pSend({ t: 'p', score: pkScores[0], answered: pkCurrentQuestionIndex[0], finished: !!finished });
+  fetch('/api/pk/room/progress', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      roomId: pkRoomId,
+      username: currentPlayer,
+      score: pkScores[0],
+      answered: pkCurrentQuestionIndex[0],
+      finished: !!finished
+    })
+  }).catch(() => {});
+}
+// 渲染对方分数/进度条/状态文字（服务器轮询与P2P直连消息共用同一渲染逻辑）
+function pkRenderOpponentProgress() {
+  document.getElementById('pkRightScore').textContent = pkOpponentProgress.score;
+  const pct = Math.min(100, Math.round((pkOpponentProgress.answered / 20) * 100));
+  document.getElementById('pkRightProgress').style.width = pct + '%';
+  // 更新对方状态文字
+  const rq = document.getElementById('pkRightQuestion');
+  if (rq) {
+    if (pkOpponentLeft) {
+      rq.textContent = langData?.pk?.opponentLeft || "对方已退出对战";
+    } else if (pkOpponentProgress.finished) {
+      rq.textContent = langData?.pk?.opponentDone || "对方已完成！";
+    } else {
+      rq.textContent = langData?.pk?.opponentAnswering || "对方答题中...";
+    }
+  }
+}
+// 对战进度轮询：同步对方分数/进度，检测完成或离线
+function pkStartRoomPolling() {
+  pkStopRoomPolling();
+  // P2P直连已建立时降低服务器轮询频率（进度优先走DataChannel，轮询仅作回退与心跳）
+  const interval = pkP2pDcOpen ? 10000 : 1500;
+  pkRoomPollTimer = setInterval(async () => {
+    if (!pkRoomId || !currentPlayer || !pkGameStarted) { pkStopRoomPolling(); return; }
+    try {
+      const r = await pkApi('/api/pk/room/state?roomId=' + encodeURIComponent(pkRoomId) + '&username=' + encodeURIComponent(currentPlayer));
+      if (!r.success) {
+        pkHandleOpponentLeft();
+        return;
+      }
+      pkOpponentProgress = r.opponent;
+      pkOpponentLeft = r.opponentLeft;
+      pkRenderOpponentProgress();
+
+      if (pkOpponentLeft) {
+        pkHandleOpponentLeft();
+      } else if (pkOpponentProgress.finished) {
+        pkMaybeEndGame(false);
+      }
+    } catch (e) { /* 网络抖动忽略，下轮重试 */ }
+  }, interval);
+}
+
+function pkStopRoomPolling() {
+  if (pkRoomPollTimer) {
+    clearInterval(pkRoomPollTimer);
+    pkRoomPollTimer = null;
+  }
+}
+// 对方退出对战：停止计时与轮询，提示后我方也退出返回主页面
+function pkHandleOpponentLeft() {
+  if (!pkGameStarted) return; // 已退出则忽略，避免轮询重复触发
+  pkGameStarted = false;
+  pkStopRoomPolling();
+  if (pkTimerInterval) {
+    clearInterval(pkTimerInterval);
+    pkTimerInterval = null;
+  }
+  alert(langData?.pk?.opponentLeft || "对方已退出对战");
+  hidePKMode();
+}
+// 结算检查：自己完成后，对方也完成才显示结果
+function pkMaybeEndGame() {
+  if (!pkGameStarted || !pkMyFinished) return;
+  if (pkOpponentProgress.finished) {
+    endPKGame();
+  }
+}
+// 开始PK计时器
+function startPKTimer() {
+  pkTimeLeft = 60;
+  document.getElementById('pkTimer').innerHTML = `<span>⏰</span><span>剩余时间：60s</span>`;
+
+  if (pkTimerInterval) {
+    clearInterval(pkTimerInterval);
+  }
+
+  pkTimerInterval = setInterval(() => {
+    pkTimeLeft--;
+    document.getElementById('pkTimer').innerHTML = `<span>⏰</span><span>剩余时间：${pkTimeLeft}s</span>`;
+
+    if (pkTimeLeft <= 0) {
+      clearInterval(pkTimerInterval);
+      pkTimerInterval = null;
+      pkTimeUp();
+    }
+  }, 1000);
+}
+// 时间到：标记自己完成，等待对方后结算
+function pkTimeUp() {
+  if (pkMyFinished) return;
+  pkMyFinished = true;
+  document.getElementById('pkLeftQuestion').textContent = langData?.pk?.timeUp || "时间到！等待对方完成...";
+  document.getElementById('pkLeftOptions').innerHTML = '';
+  pkReportProgress(true);
+  pkMaybeEndGame(false);
+}
+// 结束PK游戏
+function endPKGame() {
+  if (!pkGameStarted) return;
+  pkGameStarted = false;
+
+  if (pkTimerInterval) {
+    clearInterval(pkTimerInterval);
+    pkTimerInterval = null;
+  }
+  pkStopRoomPolling();
+  pkStopP2pPolling();
+
+  pkScores[1] = pkOpponentProgress.score;
+
+  document.getElementById('pkTimerContainer').style.marginTop = '0px';
+  // 游戏结束，显示结果
+  const leftPlayer = document.getElementById('pkLeftPlayer');
+  const rightPlayer = document.getElementById('pkRightPlayer');
+  
+  document.getElementById('pkLeftQuestion').textContent = '';
+  document.getElementById('pkRightQuestion').textContent = '';
+  document.getElementById('pkLeftOptions').innerHTML = '';
+  document.getElementById('pkRightOptions').innerHTML = '';
+  
+  leftPlayer.innerHTML = '';
+  rightPlayer.innerHTML = '';
+  // 显示游戏结果（提示语按双方最终选定题库的语言包显示）
+  const pkL = pkLangData || langData;
+  const winText = pkL?.pk?.win || "胜利";
+  const tryAgainText = pkL?.pk?.tryAgain || "失败";
+  const drawText = pkL?.pk?.draw || "平局";
+  const scoreText = (score) => (pkL?.pk?.score || "分数: {{score}}").replace("{{score}}", score);
+  const winMsg = pkL?.pk?.winMsg || "你真是字谜达人！";
+  const tryAgainMsg = pkL?.pk?.tryAgainMsg || "再接再厉！";
+  const drawMsg = pkL?.pk?.drawMsg || "旗鼓相当！";
+  
+  if (pkScores[0] > pkScores[1]) {
+    showPKResultWindow(leftPlayer, winText, pkScores[0], winMsg, 'gold');
+    showPKResultWindow(rightPlayer, tryAgainText, pkScores[1], tryAgainMsg, 'red');
+    createConfetti(document.getElementById('pkModeContainer'));
+  } else if (pkScores[1] > pkScores[0]) {
+    showPKResultWindow(leftPlayer, tryAgainText, pkScores[0], tryAgainMsg, 'red');
+    showPKResultWindow(rightPlayer, winText, pkScores[1], winMsg, 'gold');
+    createConfetti(document.getElementById('pkModeContainer'));
+  } else {
+    showPKResultWindow(leftPlayer, drawText, pkScores[0], drawMsg, 'green');
+    showPKResultWindow(rightPlayer, drawText, pkScores[1], drawMsg, 'green');
+  }
+  
+  setTimeout(() => {
+    hidePKMode();
+  }, 5000);
+}
+// 显示PK结果窗口
+function showPKResultWindow(container, result, score, message, type) {
+  // 创建窗口元素
+  const windowElement = document.createElement('div');
+  
+  if (type === 'gold') {
+    windowElement.style.background = 'linear-gradient(135deg, #ffd700 0%, #ffed4e 100%)';
+    windowElement.style.border = '3px solid #ffed4e';
+    windowElement.style.boxShadow = '0 8px 32px rgba(255, 215, 0, 0.5)';
+  } else if (type === 'red') {
+    windowElement.style.background = 'rgba(255, 82, 82, 0.8)';
+    windowElement.style.border = '3px solid #ff5252';
+    windowElement.style.boxShadow = '0 8px 32px rgba(255, 82, 82, 0.5)';
+  } else {
+    windowElement.style.background = 'linear-gradient(135deg, #00c853 0%, #69f0ae 100%)';
+    windowElement.style.border = '3px solid #69f0ae';
+    windowElement.style.boxShadow = '0 8px 32px rgba(0, 200, 83, 0.5)';
+  }
+  
+  windowElement.style.width = '80%';
+  windowElement.style.height = '60%';
+  windowElement.style.borderRadius = '20px';
+  windowElement.style.display = 'flex';
+  windowElement.style.flexDirection = 'column';
+  windowElement.style.justifyContent = 'center';
+  windowElement.style.alignItems = 'center';
+  windowElement.style.padding = '20px';
+  windowElement.style.animation = 'fadeIn 0.5s ease';
+  windowElement.style.margin = 'auto';
+  // 结果标题
+  const resultElement = document.createElement('div');
+  resultElement.style.fontSize = '36px';
+  resultElement.style.fontWeight = 'bold';
+  resultElement.style.color = '#fff';
+  resultElement.style.textShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
+  resultElement.style.marginBottom = '20px';
+  resultElement.textContent = result;
+  // 分数
+  const scoreElement = document.createElement('div');
+  scoreElement.style.fontSize = '28px';
+  scoreElement.style.fontWeight = 'bold';
+  scoreElement.style.color = '#fff';
+  scoreElement.style.textShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
+  scoreElement.style.marginBottom = '10px';
+  scoreElement.textContent = `分数: ${score}`;
+  // 消息
+  const messageElement = document.createElement('div');
+  messageElement.style.fontSize = '20px';
+  messageElement.style.fontWeight = 'bold';
+  messageElement.style.color = '#fff';
+  messageElement.style.textShadow = '0 2px 4px rgba(0, 0, 0, 0.3)';
+  messageElement.textContent = message;
+  
+  windowElement.appendChild(resultElement);
+  windowElement.appendChild(scoreElement);
+  windowElement.appendChild(messageElement);
+  
+  container.appendChild(windowElement);
+}
+// 创建星星效果
+function createConfetti(container) {
+  // 星星颜色
+  const colors = ['#ffd700', '#ffed4e', '#ff9800', '#ffc107'];
+  
+  for (let i = 0; i < 50; i++) {
+    const star = document.createElement('div');
+    // 随机大小
+    const size = Math.random() * 10 + 5;
+    // 随机位置
+    const x = Math.random() * 100;
+    const y = Math.random() * 100;
+    // 随机颜色
+    const color = colors[Math.floor(Math.random() * colors.length)];
+    // 随机角度
+    const angle = Math.random() * 360;
+    // 随机速度
+    const duration = Math.random() * 3 + 2;
+    
+    star.style.position = 'absolute';
+    star.style.left = x + '%';
+    star.style.top = y + '%';
+    star.style.width = size + 'px';
+    star.style.height = size + 'px';
+    star.style.backgroundColor = color;
+    star.style.clipPath = 'polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)';
+    star.style.transform = `rotate(${angle}deg)`;
+    star.style.animation = `confetti ${duration}s ease-in-out forwards`;
+    star.style.pointerEvents = 'none';
+    
+    container.appendChild(star);
+    
+    setTimeout(() => {
+      star.remove();
+    }, duration * 1000);
+  }
+}
+// 从服务器加载当前题库的进度（进度以 {题库id}-completelevel 为键存储）
+let progressReady = false; // 当前账号进度是否已从服务器加载完成（未就绪时禁止保存，防止旧账号数据写入新账号）
+// 重置账号相关全局状态（切换账号时防止上一个账号的数据残留串入）
+function resetAccountState() {
+  playerPoints = 0;
+  claimedAchievements = [];
+  playerFlags = { easter: false, vipLink: false };
+  ownedShopItems = [];
+  shopLevels = {};
+  uiEffectsEnabled = {};
+  currentPlayerHasPassword = false;
+  currentPlayerHas2fa = false;
+  allBankProgress = {};
+  bankPages.forEach(p => {
+    pageProgressMap[p.key] = new Array(p.levels.length).fill(null);
+  });
+  updatePointsBadge();
+}
+
+function loadProgress() {
+  if (!currentPlayer) return Promise.resolve();
+  progressReady = false;
+  resetAccountState();
+  return fetch('/api/player/progress?username=' + encodeURIComponent(currentPlayer))
+    .then(response => response.json())
+    .then(result => {
+      const data = result.success ? result.data : {};
+      applyBankProgress(data);
+      buildAllBankProgress(data); // 全题库进度快照（全局成就统计用）
+      initPointsFromProgress(data); // 积分初始化（旧存档按通关进度补算）
+      claimedAchievements = Array.isArray(data.achvClaimed) ? data.achvClaimed.map(String) : [];
+      playerFlags = Object.assign({ easter: false, vipLink: false }, (data.flags && typeof data.flags === 'object') ? data.flags : {});
+      ownedShopItems = Array.isArray(data.shopOwned) ? data.shopOwned.map(String) : [];
+      shopLevels = (data.shopLevels && typeof data.shopLevels === 'object' && !Array.isArray(data.shopLevels)) ? data.shopLevels : {};
+      uiEffectsEnabled = (data.uiEffectsEnabled && typeof data.uiEffectsEnabled === 'object' && !Array.isArray(data.uiEffectsEnabled)) ? data.uiEffectsEnabled : {};
+      currentPlayerHasPassword = !!(data.passwordHash && data.passwordSalt);
+      currentPlayerHas2fa = !!data.twoFactorEnabled;
+      if (allBankShopItems === null) loadShopItems().catch(() => {}); // 预加载卖品定义（等级效果用）
+
+      if (data.settings) {
+        settings = Object.assign({
+          floatAnimations: false,
+          sound: true,
+          music: true,
+          bgmVolume: 0.4,
+          language: 'zh-cn'
+        }, data.settings);
+      }
+      if (bgmAudio) {
+        bgmAudio.volume = settings.bgmVolume;
+        if (!settings.music) bgmAudio.pause();
+      }
+      updateBgmNextBtnVisibility();
+
+      loadLanguage();
+
+      updateTitleAnimation();
+
+      document.getElementById('pkModeContainer').classList.add('hide');
+      showCategory(firstPageKey());
+      progressReady = true; // 进度加载完成，允许保存
+    })
+    .catch(error => {
+      console.error('加载进度失败:', error);
+      bankPages.forEach(p => {
+        pageProgressMap[p.key] = new Array(p.levels.length).fill(null);
+      });
+      document.getElementById('pkModeContainer').classList.add('hide');
+      showCategory(firstPageKey());
+    });
+}
+// 保存进度到服务器（异步，返回Promise供切换题库时等待）
+function saveProgressAsync() {
+  if (!currentPlayer || !progressReady) return Promise.resolve();
+  const progressData = {
+    username: currentPlayer,
+    bankId: currentBankId,
+    pageProgress: pageProgressMap,
+    points: playerPoints,
+    achvClaimed: claimedAchievements,
+    flags: playerFlags,
+    shopOwned: ownedShopItems,
+    shopLevels: shopLevels,
+    uiEffectsEnabled: uiEffectsEnabled,
+    settings: settings
+  };
+
+  return fetch('/api/player/progress', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(progressData)
+  })
+  .then(response => {
+    if (!response.ok) {
+      throw new Error('服务器响应错误');
+    }
+    return response.json();
+  })
+  .then(data => {
+    if (!data.success) {
+      console.error('保存进度失败:', data.error || '未知错误');
+    }
+  })
+  .catch(error => {
+    console.error('保存进度失败:', error);
+  });
+}
+// 保存进度到服务器
+function saveProgress() {
+  saveProgressAsync();
+}
+// 保存设置到服务器
+function saveSettings() {
+  saveProgress(); // 保存设置时也保存所有进度
+}
+// 初始化设置页面
+function initSettings() {
+  refreshSecurityButtons();
+  // 设置语言选择器的值
+  const languageSelect = document.getElementById('languageSelect');
+  if (languageSelect) {
+    languageSelect.value = settings.language;
+    languageSelect.onchange = null;
+    languageSelect.onchange = function() {
+      settings.language = this.value;
+      saveSettings();
+      loadLanguage();
+    };
+  }
+  // 设置音效开关
+  const soundToggle = document.getElementById('soundToggle');
+  if (soundToggle) {
+    soundToggle.checked = settings.sound;
+    soundToggle.onchange = null;
+    soundToggle.onchange = function() {
+      settings.sound = this.checked;
+      saveSettings();
+    };
+  }
+  // 设置背景音乐开关
+  const musicToggle = document.getElementById('musicToggle');
+  if (musicToggle) {
+    musicToggle.checked = settings.music;
+    musicToggle.onchange = null;
+    musicToggle.onchange = function() {
+      setMusicEnabled(this.checked);
+      saveSettings();
+    };
+  }
+  // 设置背景音乐音量
+  const bgmVolumeSlider = document.getElementById('bgmVolumeSlider');
+  if (bgmVolumeSlider) {
+    bgmVolumeSlider.value = settings.bgmVolume;
+    bgmVolumeSlider.oninput = null;
+    bgmVolumeSlider.oninput = function() {
+      setBgmVolume(this.value);
+    };
+    bgmVolumeSlider.onchange = null;
+    bgmVolumeSlider.onchange = function() {
+      setBgmVolume(this.value);
+      saveSettings();
+    };
+  }
+  // 设置浮动动画开关
+  const floatToggle = document.getElementById('floatToggle');
+  if (floatToggle) {
+    floatToggle.checked = settings.floatAnimations;
+    floatToggle.onchange = null;
+    floatToggle.onchange = function() {
+      settings.floatAnimations = this.checked;
+      updateTitleAnimation();
+      saveSettings();
+    };
+  }
+}
+// 更新标题动画
+function updateTitleAnimation() {
+  // 找到标题和标题图标元素
+  const title = document.querySelector('.title');
+  const titleIcons = document.querySelectorAll('.title-icon');
+  
+  titleIcons.forEach(icon => {
+    if (settings.floatAnimations) {
+      icon.style.animation = 'wiggle 1s ease-in-out infinite';
+    } else {
+      icon.style.animation = 'none';
+    }
+  });
+  
+  if (settings.floatAnimations) {
+    if (title) {
+      title.style.animation = 'float 2s ease-in-out infinite';
+    }
+  } else {
+    if (title) {
+      title.style.animation = 'fadeIn 0.8s ease';
+    }
+  }
+}
+// 注销用户：二次确认后删除玩家数据并回到登录界面
+function deleteAccount() {
+  const confirmMsg = langData?.confirm?.deleteAccount || '确定要注销当前用户吗？所有游戏数据将被删除且不可恢复！';
+  const reconfirmMsg = langData?.confirm?.deleteAccountReconfirm || '再次确认：注销后无法恢复，确定继续吗？';
+  if (!confirm(confirmMsg)) return;
+  if (!confirm(reconfirmMsg)) return;
+  fetch('/api/player/delete?username=' + encodeURIComponent(currentPlayer), {
+    method: 'DELETE'
+  })
+  .then(response => response.json())
+  .then(data => {
+    if (data.success) {
+      currentPlayer = null;
+      localStorage.removeItem('czm_currentPlayer');
+      updateUserBadge();
+      hideSettings();
+      showLoginOverlay({ hint: langData?.alert?.accountDeleted || '用户已注销，请重新登录' });
+    } else {
+      alert(langData?.alert?.deleteFailed || '注销用户失败！');
+    }
+  })
+  .catch(error => {
+    console.error('注销用户失败:', error);
+    alert(langData?.alert?.deleteFailed || '注销用户失败！');
+  });
+}
+// 进度将在玩家登录成功后加载（见 initAuth / loginRequest）
+
+function createConfetti() {
+  const colors = ['#FFD700', '#FF6347', '#4682B4', '#32CD32', '#9370DB', '#FF69B4', '#87CEFA', '#FFA500'];
+  for (let i = 0; i < 100; i++) {
+    const confetti = document.createElement('div');
+    confetti.className = 'confetti';
+    confetti.style.left = Math.random() * 100 + '%';
+    confetti.style.top = '-20px';
+    confetti.style.backgroundColor = colors[Math.floor(Math.random() * colors.length)];
+    confetti.style.animationDuration = (Math.random() * 3 + 2) + 's';
+    confetti.style.animationDelay = Math.random() * 0.5 + 's';
+    confetti.style.transform = 'rotate(' + Math.random() * 360 + 'deg)';
+    document.body.appendChild(confetti);
+    
+    setTimeout(() => {
+      confetti.remove();
+    }, 5000);
+  }
+}
+// 显示指定标签页（标签页由当前题库 pages 动态生成）
+function showCategory(key) {
+  if (!key) key = firstPageKey();
+  document.querySelectorAll('.category-content').forEach(el => el.classList.add('hide'));
+  document.getElementById('game').classList.add('hide');
+  document.getElementById('aboutPage').classList.add('hide');
+  document.getElementById('helpPage').classList.add('hide');
+  document.getElementById('settingsPage').classList.add('hide');
+  const pkContainer = document.getElementById('pkModeContainer');
+  pkContainer.classList.add('hide');
+  pkContainer.style.display = 'none';
+
+  document.getElementById('navContainer').classList.remove('hide');
+  // 显示选中的标签页内容并生成关卡按钮
+  const content = document.getElementById('page-' + safeDomKey(key) + 'Content');
+  if (content) content.classList.remove('hide');
+  currentPageKey = key;
+  previousPage = key;
+  generateLevelButtonsFor(key);
+}
+// 生成关卡按钮的通用函数
+function generateLevelButtonsGeneric(containerId, levelsData, completedLevelsData, startFunction) {
+  const wrap = document.getElementById(containerId);
+  if (!wrap) return; // 确保元素存在
+  wrap.innerHTML = "";
+  const total = levelsData.length;
+  if (!total) return;
+  // 用 DocumentFragment 批量插入，减少重排次数
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < total; i++) {
+    const btn = document.createElement("button");
+    btn.className = "level-btn";
+    btn.style.animationDelay = `${i * 0.08}s`;
+    if (completedLevelsData[i]) {
+      const levelText = langData?.level || "第{{level}}关";
+      let translatedPrize = completedLevelsData[i];
+      const prize = completedLevelsData[i];
+      const first = langData?.prize.first || "一等奖";
+      const second = langData?.prize.second || "二等奖";
+      const third = langData?.prize.third || "三等奖";
+      const none = langData?.prize.none || "未获奖";
+      if (prize === "一等奖" || prize === "First Prize" || prize === first) {
+        translatedPrize = first; btn.classList.add("prize-1");
+      } else if (prize === "二等奖" || prize === "Second Prize" || prize === second) {
+        translatedPrize = second; btn.classList.add("prize-2");
+      } else if (prize === "三等奖" || prize === "Third Prize" || prize === third) {
+        translatedPrize = third; btn.classList.add("prize-3");
+      } else {
+        translatedPrize = none; btn.classList.add("prize-0");
+      }
+      btn.innerText = `${levelText.replace("{{level}}", i + 1)} ${translatedPrize}`;
+    } else {
+      const levelText = langData?.level || "第{{level}}关";
+      btn.innerText = levelText.replace("{{level}}", i + 1);
+    }
+    btn.onclick = () => { playSound('click'); startFunction(i); };
+    frag.appendChild(btn);
+  }
+  wrap.appendChild(frag);
+}
+// 生成指定标签页的关卡按钮
+function generateLevelButtonsFor(key) {
+  const page = getPage(key);
+  if (!page) return;
+  generateLevelButtonsGeneric(
+    'page-' + safeDomKey(key) + 'LevelWrap',
+    page.levels,
+    pageProgressMap[key] || [],
+    startLevel
+  );
+}
+// 深合并：将 override 深合并到 base，对象递归合并，数组/原始类型直接覆盖
+function deepMergeLang(base, override) {
+  if (!override || typeof override !== 'object') return base;
+  const out = Array.isArray(base) ? [...base] : { ...base };
+  for (const key of Object.keys(override)) {
+    const bv = base[key];
+    const ov = override[key];
+    if (bv && typeof bv === 'object' && !Array.isArray(bv) && ov && typeof ov === 'object' && !Array.isArray(ov)) {
+      out[key] = deepMergeLang(bv, ov);
+    } else if (ov !== undefined) {
+      out[key] = ov;
+    }
+  }
+  return out;
+}
+// 加载语言文件（基础语言与题库专属语言并行请求，JSON解析在Worker线程完成，深合并后生效）
+async function loadLanguage() {
+  let lang = settings.language || 'zh-cn';
+  let base = null, bankLang = null;
+  // 并行请求：基础语言包 + 题库专属语言包
+  const baseReq = fetchJsonInWorker('lang/' + lang + '.json').then(d => { base = d; }).catch(() => {});
+  const bankReq = currentBankId
+    ? fetchJsonInWorker('lang/' + currentBankId + '-' + lang + '.json').then(d => { bankLang = d; }).catch(() => {})
+    : Promise.resolve();
+  await Promise.all([baseReq, bankReq]);
+  if (!base) {
+    settings.language = 'zh-cn';
+    lang = 'zh-cn';
+    bankLang = null;
+    try { base = await fetchJsonInWorker('lang/zh-cn.json'); } catch (e) { /* 忽略 */ }
+    if (base && currentBankId) {
+      try { bankLang = await fetchJsonInWorker('lang/' + currentBankId + '-zh-cn.json'); } catch (e) { /* 忽略 */ }
+    }
+  }
+  if (!base) { console.error('加载语言文件失败'); return; }
+  langData = deepMergeLang(base, bankLang);
+  updateUI();
+  generateLevelButtonsFor(previousPage === 'game' ? currentPageKey : previousPage);
+}
+// 更新UI文本
+function updateUI() {
+  if (!langData) return;
+  // 更新左下角题库切换按钮与菜单
+  const bankSwitchText = document.getElementById('bankSwitchText');
+  if (bankSwitchText) bankSwitchText.textContent = langData?.bank?.button || "题库";
+  const bankMenuTitle = document.getElementById('bankMenuTitle');
+  if (bankMenuTitle) bankMenuTitle.textContent = langData?.bank?.menuTitle || "切换题库";
+  const bgmNextText = document.getElementById('bgmNextText');
+  if (bgmNextText) bgmNextText.textContent = langData?.bgm?.next || "下一首";
+  renderBankMenu();
+  // 更新关于、帮助、设置按钮
+  const aboutBtn = document.querySelector('.about-btn');
+  if (aboutBtn) {
+    aboutBtn.textContent = langData?.buttons?.about || "关于";
+  }
+  const helpBtn = document.querySelector('.help-btn');
+  if (helpBtn) {
+    helpBtn.textContent = langData?.buttons?.help || "帮助";
+  }
+  const settingsBtn = document.querySelector('.settings-btn');
+  if (settingsBtn) {
+    settingsBtn.textContent = langData?.buttons?.settings || "设置";
+  }
+  const achvBtn = document.querySelector('.achv-btn');
+  if (achvBtn) {
+    achvBtn.textContent = langData?.buttons?.achievements || "成就";
+  }
+  const shopBtn = document.querySelector('.shop-btn');
+  if (shopBtn) {
+    shopBtn.textContent = langData?.buttons?.shop || "商店";
+  }
+  const pointsBadge = document.getElementById('pointsBadge');
+  if (pointsBadge) {
+    pointsBadge.title = langData?.points?.title || "积分";
+  }
+  
+  bankPages.forEach(p => {
+    const translated = (langData?.nav?.[p.key]) || (langData?.categories?.[p.key]) || p.name;
+    const navBtn = document.getElementById('nav-' + safeDomKey(p.key));
+    if (navBtn) navBtn.textContent = translated;
+    const catTitle = document.querySelector('#page-' + safeDomKey(p.key) + 'Content .category-title');
+    if (catTitle) catTitle.textContent = translated;
+  });
+  // 更新关于页面
+  const aboutPageH2 = document.querySelector('#aboutPage h2');
+  if (aboutPageH2) {
+    aboutPageH2.textContent = langData?.about?.title || "游戏说明";
+  }
+  const aboutPageH3Rules = document.querySelector('#aboutPage h3:nth-child(2)');
+  if (aboutPageH3Rules) {
+    aboutPageH3Rules.textContent = langData?.about?.rules || "游戏规则";
+  }
+  // 更新游戏规则内容
+  const aboutPageRulesUl = document.querySelector('#aboutPage h3:nth-child(2) + ul');
+  if (aboutPageRulesUl && langData?.about?.rulesContent) {
+    aboutPageRulesUl.innerHTML = '';
+    langData.about.rulesContent.forEach(rule => {
+      const li = document.createElement('li');
+      li.textContent = rule;
+      aboutPageRulesUl.appendChild(li);
+    });
+  }
+  const aboutPageH3Feature = document.querySelector('#aboutPage h3:nth-child(4)');
+  if (aboutPageH3Feature) {
+    aboutPageH3Feature.textContent = langData?.about?.feature || "游戏特色";
+  }
+  // 更新游戏特色内容
+  const aboutPageFeatureUl = document.querySelector('#aboutPage h3:nth-child(4) + ul');
+  if (aboutPageFeatureUl && langData?.about?.featureContent) {
+    aboutPageFeatureUl.innerHTML = '';
+    langData.about.featureContent.forEach(feature => {
+      const li = document.createElement('li');
+      li.textContent = feature;
+      aboutPageFeatureUl.appendChild(li);
+    });
+  }
+  const aboutPageH3Tips = document.querySelector('#aboutPage h3:nth-child(6)');
+  if (aboutPageH3Tips) {
+    aboutPageH3Tips.textContent = langData?.about?.tips || "哈气技巧";
+    // 更新哈气技巧内容
+    const aboutPageTipsImg = aboutPageH3Tips.nextElementSibling;
+    if (aboutPageTipsImg && aboutPageTipsImg.tagName === 'IMG') {
+      const aboutPageTipsP = aboutPageTipsImg.nextElementSibling;
+      if (aboutPageTipsP && aboutPageTipsP.tagName === 'P' && langData?.about?.tipsContent) {
+        aboutPageTipsP.textContent = langData.about.tipsContent;
+      }
+    }
+  }
+  const aboutPageCreator1 = document.querySelector('#aboutPage .creator-info p:nth-child(1)');
+  if (aboutPageCreator1) {
+    aboutPageCreator1.innerHTML = `<strong>${langData?.about?.creator || "制作者："}</strong>XLNEW,小左ze13`;
+  }
+  const aboutPageCreator2 = document.querySelector('#aboutPage .creator-info p:nth-child(2)');
+  if (aboutPageCreator2) {
+    aboutPageCreator2.innerHTML = `<strong>${langData?.about?.tool || "开发工具："}</strong>TraeCN`;
+  }
+  const aboutPageCreator3 = document.querySelector('#aboutPage .creator-info p:nth-child(3)');
+  if (aboutPageCreator3) {
+    aboutPageCreator3.innerHTML = `<strong>${langData?.about?.version || "版本："}</strong>V1.6-beta1 20261110`;
+  }
+  const aboutPageCreator4 = document.querySelector('#aboutPage .creator-info p:nth-child(4)');
+  if (aboutPageCreator4) {
+    aboutPageCreator4.innerHTML = `<strong>${langData?.about?.bilibili || "在Bilibili找到我们："}</strong>`;
+  }
+  const aboutPageButton = document.querySelector('#aboutPage button');
+  if (aboutPageButton) {
+    aboutPageButton.textContent = langData?.buttons?.return || "返回游戏";
+  }
+  // 更新帮助页面
+  const helpPageH2 = document.querySelector('#helpPage h2');
+  if (helpPageH2) {
+    helpPageH2.textContent = langData?.help?.title || "游戏帮助";
+  }
+  const helpPageH3Rules = document.querySelector('#helpPage h3:nth-child(2)');
+  if (helpPageH3Rules) {
+    helpPageH3Rules.textContent = langData?.help?.gameRules || "🎯 游戏规则";
+  }
+  // 更新游戏规则内容
+  const helpPageRulesUl = document.querySelector('#helpPage h3:nth-child(2) + ul');
+  if (helpPageRulesUl && langData?.help?.gameRulesContent) {
+    helpPageRulesUl.innerHTML = '';
+    langData.help.gameRulesContent.forEach(rule => {
+      const li = document.createElement('li');
+      li.textContent = rule;
+      helpPageRulesUl.appendChild(li);
+    });
+  }
+  const helpPageH3Tips = document.querySelector('#helpPage h3:nth-child(4)');
+  if (helpPageH3Tips) {
+    helpPageH3Tips.textContent = langData?.help?.tips || "💡 答题技巧";
+  }
+  // 更新答题技巧内容
+  const helpPageTipsUl = document.querySelector('#helpPage h3:nth-child(4) + ul');
+  if (helpPageTipsUl && langData?.help?.tipsContent) {
+    helpPageTipsUl.innerHTML = '';
+    langData.help.tipsContent.forEach(tip => {
+      const li = document.createElement('li');
+      li.textContent = tip;
+      helpPageTipsUl.appendChild(li);
+    });
+  }
+  const helpPageH3Rewards = document.querySelector('#helpPage h3:nth-child(6)');
+  if (helpPageH3Rewards) {
+    helpPageH3Rewards.textContent = langData?.help?.rewards || "🏆 奖励等级";
+  }
+  // 更新奖励等级内容
+  const helpPageRewardsUl = document.querySelector('#helpPage h3:nth-child(6) + ul');
+  if (helpPageRewardsUl && langData?.help?.rewardsContent) {
+    helpPageRewardsUl.innerHTML = '';
+    langData.help.rewardsContent.forEach(reward => {
+      const li = document.createElement('li');
+      li.textContent = reward;
+      helpPageRewardsUl.appendChild(li);
+    });
+  }
+  const helpPageCreator = document.querySelector('#helpPage .creator-info p');
+  if (helpPageCreator) {
+    helpPageCreator.innerHTML = `<strong>${langData?.help?.note || "提示："}</strong>${langData?.help?.noteContent || "多玩几次可以提高正确率哦！"}`;
+  }
+  const helpPageButton = document.querySelector('#helpPage button');
+  if (helpPageButton) {
+    helpPageButton.textContent = langData?.buttons?.return || "返回游戏";
+  }
+  // 更新设置页面
+  const settingsPageH2 = document.querySelector('#settingsPage h2');
+  if (settingsPageH2) {
+    settingsPageH2.textContent = langData?.settings?.title || "游戏设置";
+  }
+  const settingsPageH3Game = document.querySelector('#settingsPage h3:nth-child(2)');
+  if (settingsPageH3Game) {
+    settingsPageH3Game.textContent = langData?.settings?.gameSettings || "🎮 游戏设置";
+  }
+  // 更新音效开关标签
+  const soundLabel = document.getElementById('soundLabel');
+  if (soundLabel) {
+    soundLabel.textContent = langData?.settings?.sound || "音效";
+  }
+  // 更新背景音乐开关标签
+  const musicLabel = document.getElementById('musicLabel');
+  if (musicLabel) {
+    musicLabel.textContent = langData?.settings?.music || "背景音乐";
+  }
+  const bgmVolumeLabel = document.getElementById('bgmVolumeLabel');
+  if (bgmVolumeLabel) {
+    bgmVolumeLabel.textContent = langData?.settings?.bgmVolume || "音乐音量";
+  }
+  // 更新浮动动画开关标签
+  const floatLabel = document.getElementById('floatLabel');
+  if (floatLabel) {
+    floatLabel.textContent = langData?.settings?.float || "浮动动画";
+  }
+  const settingsPageH3Progress = document.querySelector('#settingsPage h3:nth-of-type(2)');
+  if (settingsPageH3Progress) {
+    settingsPageH3Progress.textContent = langData?.settings?.progress || "📊 进度管理";
+  }
+  const deleteAccountBtn = document.getElementById('deleteAccountBtn');
+  if (deleteAccountBtn) {
+    deleteAccountBtn.textContent = langData?.buttons?.deleteAccount || "注销用户";
+  }
+  // 账号安全区文字
+  const securityTitle = document.getElementById('securityTitle');
+  if (securityTitle) securityTitle.textContent = langData?.settings?.security || "🔐 账号安全";
+  const pwdLabel = document.getElementById('pwdLabel');
+  if (pwdLabel) pwdLabel.textContent = langData?.security?.password || "登录密码";
+  const twofaLabel = document.getElementById('twofaLabel');
+  if (twofaLabel) twofaLabel.textContent = langData?.security?.twofa || "二步验证 (2FA)";
+  refreshSecurityButtons();
+  const settingsPageCreator = document.querySelector('#settingsPage .creator-info p');
+  if (settingsPageCreator) {
+    settingsPageCreator.innerHTML = `<strong>${langData?.settings?.note || "提示：设置会自动保存"}</strong>`;
+  }
+  const returnGameBtn = document.getElementById('returnGameBtn');
+  if (returnGameBtn) {
+    returnGameBtn.textContent = langData?.buttons?.return || "返回游戏";
+  }
+  // 更新语言选择器标签
+  const languageLabel = document.getElementById('languageLabel');
+  if (languageLabel) {
+    languageLabel.textContent = langData?.settings?.language || "语言";
+  }
+  // 更新游戏页面
+  const nextBtn = document.querySelector('.next-btn');
+  if (nextBtn) {
+    if (typeof idx !== 'undefined' && list && idx + 1 === list.length) {
+      nextBtn.innerText = langData?.buttons.complete || "完成";
+    } else {
+      nextBtn.innerText = langData?.buttons.next || "下一题 ➡️";
+    }
+  }
+  const backBtn = document.querySelector('.back-btn');
+  if (backBtn) {
+    backBtn.textContent = langData?.buttons.back || "🏠 返回";
+  }
+  // 更新当前标签页的关卡按钮
+  const refreshKey = previousPage === 'game' ? currentPageKey : (previousPage || currentPageKey);
+  if (refreshKey) generateLevelButtonsFor(refreshKey);
+  // 更新PK模式
+  const pkModeBtn = document.querySelector('.pk-mode-btn');
+  if (pkModeBtn) {
+    pkModeBtn.textContent = langData?.pk?.mode || "PK模式";
+  }
+  
+  const pkStartBtn = document.getElementById('pkStartBtn');
+  if (pkStartBtn) {
+    pkStartBtn.textContent = langData?.pk?.start || "开始游戏";
+  }
+  
+  const pkReturnBtn = document.getElementById('pkReturnBtn');
+  if (pkReturnBtn) {
+    pkReturnBtn.textContent = langData?.pk?.return || "返回主页面";
+  }
+  // 更新PK匹配队列界面文本
+  const pkMatchTitle = document.getElementById('pkMatchTitle');
+  if (pkMatchTitle) pkMatchTitle.textContent = langData?.pk?.matchTitle || "匹配队列";
+  const pkMatchHint = document.getElementById('pkMatchHint');
+  if (pkMatchHint) pkMatchHint.textContent = langData?.pk?.matchHint || "请在另一台设备上打开本页面，进入PK模式并点击开始游戏，即可自动匹配";
+  const pkMatchCancelBtn = document.getElementById('pkMatchCancelBtn');
+  if (pkMatchCancelBtn) pkMatchCancelBtn.textContent = langData?.pk?.matchCancelBtn || "取消匹配";
+  // 更新登录/用户界面文本
+  const loginTitle = document.getElementById('loginTitle');
+  if (loginTitle) loginTitle.textContent = langData?.auth?.welcome || "欢迎来到字谜闯关游戏";
+  const loginSubtitle = document.getElementById('loginSubtitle');
+  if (loginSubtitle) loginSubtitle.textContent = langData?.auth?.subtitle || "首次进入请输入用户名，系统将自动为你创建角色";
+  const usernameInputEl = document.getElementById('usernameInput');
+  if (usernameInputEl) usernameInputEl.placeholder = langData?.auth?.placeholder || "请输入用户名";
+  const loginBtn = document.getElementById('loginBtn');
+  if (loginBtn) loginBtn.textContent = langData?.auth?.enter || "进入游戏";
+  const switchAccountText = document.getElementById('switchAccountText');
+  if (switchAccountText) switchAccountText.textContent = langData?.auth?.switch || "切换账号";
+  const logoutText = document.getElementById('logoutText');
+  if (logoutText) logoutText.textContent = langData?.auth?.logout || "退出登录";
+  
+  const pkLeftPlayer = document.querySelector('#pkLeftPlayer h3');
+  if (pkLeftPlayer) {
+    pkLeftPlayer.textContent = pkDisplayName(0);
+  }
+
+  const pkRightPlayer = document.querySelector('#pkRightPlayer h3');
+  if (pkRightPlayer) {
+    pkRightPlayer.textContent = pkDisplayName(1);
+  }
+  
+  const pkLeftQuestion = document.getElementById('pkLeftQuestion');
+  if (pkLeftQuestion && pkLeftQuestion.textContent === '准备开始') {
+    pkLeftQuestion.textContent = langData?.pk?.prepare || "准备开始";
+  }
+  
+  const pkRightQuestion = document.getElementById('pkRightQuestion');
+  if (pkRightQuestion && pkRightQuestion.textContent === '准备开始') {
+    pkRightQuestion.textContent = langData?.pk?.prepare || "准备开始";
+  }
+  // 更新彩蛋窗口
+  const easterEggTitle = document.getElementById('easterEggTitle');
+  if (easterEggTitle) {
+    easterEggTitle.textContent = langData?.easterEgg?.title || "🎉 恭喜你发现了彩蛋！";
+  }
+  
+  const easterEggMessage = document.getElementById('easterEggMessage');
+  if (easterEggMessage) {
+    easterEggMessage.textContent = langData?.easterEgg?.message || "你是一个细心的玩家！\n\n继续享受游戏吧！";
+  }
+  
+  const easterEggCloseBtn = document.getElementById('easterEggCloseBtn');
+  if (easterEggCloseBtn) {
+    easterEggCloseBtn.textContent = langData?.easterEgg?.close || "关闭";
+  }
+  // 更新VIP彩蛋窗口
+  const vipEggTitle = document.getElementById('vipEggTitle');
+  if (vipEggTitle) vipEggTitle.textContent = langData?.vip?.title || "👑 VIP 专属特权";
+  const vipEggDesc = document.getElementById('vipEggDesc');
+  if (vipEggDesc) vipEggDesc.textContent = langData?.vip?.desc || "点击下方获得vip特权";
+  const vipEggLink = document.getElementById('vipEggLink');
+  if (vipEggLink) vipEggLink.textContent = langData?.vip?.get || "点我获取";
+  const vipEggCloseBtn = document.getElementById('vipEggCloseBtn');
+  if (vipEggCloseBtn) vipEggCloseBtn.textContent = langData?.vip?.close || "关闭";
+  // 更新通关结算窗口按钮
+  const levelResultRetryBtn = document.getElementById('levelResultRetryBtn');
+  if (levelResultRetryBtn) levelResultRetryBtn.textContent = langData?.game?.retry || "🔄 再试一次";
+  const levelResultBackBtn = document.getElementById('levelResultBackBtn');
+  if (levelResultBackBtn) levelResultBackBtn.textContent = langData?.game?.backHome || "🏠 返回主页面";
+}
+
+window.addEventListener('load', function() {
+  document.getElementById('pkModeContainer').classList.add('hide');
+});
+// 开始当前标签页的指定关卡
+function startLevel(n) {
+  const page = getPage(currentPageKey);
+  if (!page) return;
+  clearAutoNextTimer(); // 清除可能残留的自动跳题定时器
+  currentLevel = n;
+  questionList = [...page.levels[n]].sort(() => Math.random() - 0.5);
+  currentQuestionIndex = 0;
+  correctAnswerCount = 0;
+  document.getElementById("navContainer").classList.add("hide");
+  document.querySelectorAll('.category-content').forEach(el => el.classList.add('hide'));
+  document.getElementById("game").classList.remove("hide");
+  showQuestion();
+}
+// 显示当前题目标签页的题型由 pages 的 type 决定
+function showQuestion() {
+  const page = getPage(currentPageKey);
+  const item = questionList[currentQuestionIndex];
+  document.getElementById("cur").innerText = currentQuestionIndex + 1;
+  document.getElementById("total").innerText = questionList.length;
+  document.getElementById("progressFill").style.width = `${(currentQuestionIndex / questionList.length) * 100}%`;
+  const qEl = document.getElementById("q");
+  if (page && page.type === 'xiehouyu') {
+    qEl.innerHTML = `<span class="question-icon">${page.icon}</span>${item.q} ——？`;
+  } else {
+    const promptText = (currentBank && currentBank.promptText) || langData?.question?.promptText || '谜底是？';
+    qEl.innerHTML = `<span class="question-icon">${page ? page.icon : '🔍'}</span>${item.q}<br><br><strong>${promptText}</strong>`;
+  }
+  document.getElementById("tip").innerText = "";
+  // 更新题目计数器文本
+  const questionText = langData?.game.question || "第 {{current}} / {{total}} 题";
+  document.getElementById("questionCounter").innerHTML = questionText
+    .replace("{{current}}", `<span id="cur">${currentQuestionIndex + 1}</span>`)
+    .replace("{{total}}", `<span id="total">${questionList.length}</span>`);
+  // 更新下一题按钮文本和样式
+  const nextBtn = document.querySelector('.next-btn');
+  if (currentQuestionIndex + 1 === questionList.length) {
+    nextBtn.innerText = langData?.buttons.complete || "完成";
+    nextBtn.style.background = "linear-gradient(135deg, #FFD700 0%, #FFA500 100%)";
+    nextBtn.style.color = "#8B4513";
+  } else {
+    nextBtn.innerText = langData?.buttons.next || "下一题 ➡️";
+    nextBtn.style.background = "linear-gradient(135deg, #DC143C 0%, #FF6347 100%)";
+    nextBtn.style.color = "#FFD700";
+  }
+  // 随机选择一个正确答案
+  const correctAnswer = item.answers[Math.floor(Math.random() * item.answers.length)];
+  // 生成选项：1个正确答案 + 2个干扰项
+  const allOptions = [correctAnswer];
+  // 随机选择2个干扰项
+  const shuffledDistractors = [...item.distractors].sort(() => Math.random() - 0.5);
+  for (let i = 0; i < 2 && i < shuffledDistractors.length; i++) {
+    allOptions.push(shuffledDistractors[i]);
+  }
+  // 打乱选项顺序
+  const shuffled = allOptions.sort(() => Math.random() - 0.5);
+  
+  const optsDiv = document.getElementById("opts");
+  optsDiv.innerHTML = "";
+  shuffled.forEach((opt, index) => {
+    const div = document.createElement("div");
+    div.className = "opt";
+    div.innerText = opt;
+    div.style.animationDelay = `${index * 0.1}s`;
+    div.onclick = () => { playSound('click'); check(div, opt, correctAnswer, item.answers); };
+    optsDiv.appendChild(div);
+  });
+  // 等级卖品效果（古人的智慧/我是黑客）：按有效等级×10%的概率让正确答案绿色闪烁
+  const glintLevel = getGlintLevel();
+  if (glintLevel > 0 && Math.random() < glintLevel * 0.1) {
+    const hit = [...optsDiv.children].find(d => d.innerText === correctAnswer);
+    if (hit) hit.classList.add('opt-glint');
+  }
+
+  startQuestionTimer();
+}
+// 渲染答题区下方的剩余时间显示与进度条（最后3秒变红闪烁）
+function renderQuestionTimer() {
+  const el = document.getElementById('gameTimer');
+  if (!el) return;
+  el.textContent = (langData?.game?.timeLeft || "⏱ 剩余 {{s}} 秒").replace("{{s}}", questionTimeLeft);
+  el.classList.toggle('urgent', questionTimeLeft <= 3);
+  const wrap = document.getElementById('gameTimerBarWrap');
+  const bar = document.getElementById('gameTimerBar');
+  if (wrap) wrap.style.display = '';
+  if (bar) {
+    const effectiveLimit = QUESTION_TIME_LIMIT + getTimeBonusLevel();
+    bar.style.width = (questionTimeLeft / effectiveLimit * 100) + '%';
+    bar.classList.toggle('urgent', questionTimeLeft <= 3);
+  }
+}
+// 启动当前题目的倒计时
+function startQuestionTimer() {
+  stopQuestionTimer();
+  questionTimeLeft = QUESTION_TIME_LIMIT + getTimeBonusLevel();
+  renderQuestionTimer();
+  questionTimerInterval = setInterval(() => {
+    questionTimeLeft--;
+    if (questionTimeLeft <= 0) {
+      stopQuestionTimer();
+      onQuestionTimeout();
+      return;
+    }
+    if (questionTimeLeft <= 3) playSound('tick'); // 最后3秒每秒一声提示音
+    renderQuestionTimer();
+  }, 1000);
+}
+// 停止并清空倒计时显示（隐藏进度条，宽度复位供下题使用）
+function stopQuestionTimer() {
+  if (questionTimerInterval) {
+    clearInterval(questionTimerInterval);
+    questionTimerInterval = null;
+  }
+  const el = document.getElementById('gameTimer');
+  if (el) {
+    el.textContent = '';
+    el.classList.remove('urgent');
+  }
+  const wrap = document.getElementById('gameTimerBarWrap');
+  if (wrap) wrap.style.display = 'none';
+  const bar = document.getElementById('gameTimerBar');
+  if (bar) {
+    bar.style.width = '100%';
+    bar.classList.remove('urgent');
+  }
+}
+// 倒计时归零：锁定选项、标出正确答案并提示时间到
+function onQuestionTimeout() {
+  const item = questionList[currentQuestionIndex];
+  const all = document.querySelectorAll('.opt');
+  all.forEach(o => {
+    o.onclick = null;
+    if (item && item.answers.includes(o.innerText)) o.classList.add('correct');
+  });
+  document.getElementById('tip').innerHTML = `<span class='tip-icon'>⏰</span>${langData?.game?.timeUpTip || "时间到！"}`;
+  playSound('wrong');
+}
+
+function check(div, userAns, rightAns, allAnswers) {
+  stopQuestionTimer(); // 答题后停止本题倒计时
+  const all = document.querySelectorAll(".opt");
+  all.forEach(o => o.onclick = null); // 禁止重复点
+  // 检查用户答案是否在所有可能的正确答案中
+  const isCorrect = allAnswers.includes(userAns);
+  
+  if (isCorrect) {
+    correctAnswerCount++;
+    div.classList.add("correct");
+    document.getElementById("tip").innerHTML = `<span class='tip-icon'>🎉</span>${langData?.game.correct || "太棒了！答对啦！"}`;
+    playSound('correct');
+  } else {
+    div.classList.add("wrong");
+    all.forEach(o => {
+      if (allAnswers.includes(o.innerText)) o.classList.add("correct");
+    });
+    document.getElementById("tip").innerHTML = `<span class='tip-icon'>😅</span>${langData?.game.wrong || "哎呀！答错了，再接再厉！"}`;
+    playSound('wrong');
+  }
+
+  clearAutoNextTimer();
+  autoNextTimer = setTimeout(() => {
+    autoNextTimer = null;
+    next();
+  }, 3000);
+  maybeShowMetroEgg();
+}
+
+function next() {
+  clearAutoNextTimer(); // 手动进入下一题时清除自动跳题定时器，避免重复跳题
+  stopQuestionTimer(); // 离开本题时停止倒计时
+  currentQuestionIndex++;
+  if (currentQuestionIndex >= questionList.length) {
+    const accuracy = (correctAnswerCount / questionList.length * 100).toFixed(3);
+    const accuracyNum = parseFloat(accuracy);
+    // 根据正确率计算奖励等级
+    let prize = "";
+    let prizeIcon = "";
+    let prizeLevel = ""; // 用于按钮显示的等级
+    if (accuracyNum >= 100) {
+      prize = langData?.game.win || "完美通关！一等奖";
+      prizeIcon = "🏆";
+      prizeLevel = langData?.prize.first || "一等奖";
+    } else if (accuracyNum >= 80) {
+      prize = langData?.game.excellent || "优秀！二等奖";
+      prizeIcon = "🥈";
+      prizeLevel = langData?.prize.second || "二等奖";
+    } else if (accuracyNum >= 60) {
+      prize = langData?.game.good || "良好！三等奖";
+      prizeIcon = "🥉";
+      prizeLevel = langData?.prize.third || "三等奖";
+    } else {
+      prize = langData?.game.tryAgain || "还需努力";
+      prizeIcon = "💪";
+      prizeLevel = langData?.prize.none || "未获奖";
+    }
+    if (accuracyNum >= 100) {
+      playSound('win');
+      createConfetti(); // 生成五彩纸屑
+    } else {
+      playSound('levelComplete');
+      if (accuracyNum >= 80) {
+        createConfetti(); // 80%以上也生成五彩纸屑
+      }
+    }
+    const levelCompleteText = langData?.game.levelComplete || "🎉 第{{level}}关通关！\n━━━━━━━━━━━━━━\n成功率：{{accuracy}}%\n评价：{{prizeIcon}} {{prize}}\n━━━━━━━━━━━━━━";
+    const resultText = levelCompleteText
+      .replace("{{level}}", currentLevel + 1)
+      .replace("{{accuracy}}", accuracy)
+      .replace("{{prizeIcon}}", prizeIcon)
+      .replace("{{prize}}", prize);
+    // 保存当前标签页当前关卡的通关状态（首次按奖级计分，重复通关按答对题数计分）
+    let gainedPoints = 0;
+    if (pageProgressMap[currentPageKey]) {
+      gainedPoints = settleLevelPoints(
+        pageProgressMap[currentPageKey][currentLevel], prizeLevel,
+        correctAnswerCount, questionList.length);
+      pageProgressMap[currentPageKey][currentLevel] = prizeLevel;
+      syncAllBankProgress(); // 同步全题库进度快照（全局成就实时更新）
+      saveProgress();
+      generateLevelButtonsFor(currentPageKey);
+      checkAchievementClaim(); // 检查是否有已完成待领取的成就（如首次尝试/初出茅庐/字谜大师）
+    }
+
+    showLevelResult(resultText, gainedPoints);
+  } else {
+    showQuestion();
+  }
+}
+
+function backLevel() {
+  stopQuestionTimer(); // 离开答题时停止倒计时
+  clearAutoNextTimer(); // 清除自动跳题定时器
+  document.getElementById("game").classList.add("hide");
+  document.getElementById("navContainer").classList.remove("hide");
+  showCategory(currentPageKey);
+  saveProgress();
+}
+// 显示结算窗口：第一行作为标题大字显示，其余内容原样保留（分隔线剔除），下方显示本次获得的积分
+function showLevelResult(text, gainedPoints) {
+  const lines = String(text).split('\n');
+  const title = (lines[0] || '').trim();
+  const body = lines.slice(1).filter(l => !/^━+$/.test(l.trim())).join('\n').trim();
+  document.getElementById('levelResultTitle').textContent = title;
+  document.getElementById('levelResultBody').textContent = body;
+  document.getElementById('levelResultPoints').textContent =
+    (langData?.game?.pointsGained || '💰 获得 {{points}} 积分').replace('{{points}}', String(gainedPoints || 0));
+  document.getElementById('levelResultOverlay').classList.add('show');
+}
+
+function hideLevelResult() {
+  document.getElementById('levelResultOverlay').classList.remove('show');
+}
+// 再试一次：重新开始当前关卡
+function retryLevel() {
+  hideLevelResult();
+  startLevel(currentLevel);
+}
+// 返回主页面：回到当前题库的关卡选择页
+function backHomeFromResult() {
+  hideLevelResult();
+  backLevel();
+}
+// 记录进入弹层前的页面：答题页(game)或当前题库标签页
+function rememberCurrentPage() {
+  if (!document.getElementById("game").classList.contains("hide")) {
+    previousPage = 'game';
+  } else {
+    previousPage = currentPageKey || firstPageKey();
+  }
+}
+// 隐藏所有题库标签页与答题页
+function hideGameAndPages() {
+  document.querySelectorAll('.category-content').forEach(el => el.classList.add('hide'));
+  document.getElementById("game").classList.add("hide");
+}
+// 从弹层返回之前记录的页面
+function returnToPreviousPage() {
+  if (previousPage === 'game') {
+    document.getElementById("navContainer").classList.add("hide");
+    document.getElementById("game").classList.remove("hide");
+  } else {
+    showCategory(previousPage || firstPageKey());
+  }
+}
+// 切换某弹层显示（关于/帮助/设置通用）
+function toggleOverlay(showEl) {
+  const already = !showEl.classList.contains("hide");
+  if (!already) rememberCurrentPage();
+  hideGameAndPages();
+  document.getElementById("aboutPage").classList.add("hide");
+  document.getElementById("helpPage").classList.add("hide");
+  document.getElementById("settingsPage").classList.add("hide");
+  if (already) {
+    returnToPreviousPage();
+  } else {
+    showEl.classList.remove("hide");
+  }
+  playSound('click');
+}
+
+function showAbout() {
+  toggleOverlay(document.getElementById("aboutPage"));
+}
+
+function hideAbout() {
+  document.getElementById("aboutPage").classList.add("hide");
+  returnToPreviousPage();
+}
+
+function showHelp() {
+  toggleOverlay(document.getElementById("helpPage"));
+}
+
+function hideHelp() {
+  document.getElementById("helpPage").classList.add("hide");
+  returnToPreviousPage();
+}
+
+function showSettings() {
+  const settingsPage = document.getElementById("settingsPage");
+  const willShow = settingsPage.classList.contains("hide");
+  toggleOverlay(settingsPage);
+  if (willShow) initSettings();
+}
+
+function hideSettings() {
+  document.getElementById("settingsPage").classList.add("hide");
+  returnToPreviousPage();
+}
+// 彩蛋函数
+let mascotClickCount = 0;
+function mascotClick() {
+  mascotClickCount++;
+  
+  if (mascotClickCount === 3) {
+    playSound('win');
+    
+    for (let i = 0; i < 15; i++) {
+      const confetti = document.createElement('div');
+      confetti.style.position = 'fixed';
+      confetti.style.left = Math.random() * 100 + '%';
+      confetti.style.top = '100%';
+      confetti.style.fontSize = (15 + Math.random() * 20) + 'px';
+      confetti.style.pointerEvents = 'none';
+      confetti.style.zIndex = '9999';
+      confetti.innerText = ['🎊', '🎉', '🎈', '🎁', '✨', '🌟', '⭐'][Math.floor(Math.random() * 7)];
+      confetti.style.animation = `confetti ${2 + Math.random() * 2}s linear forwards`;
+      document.body.appendChild(confetti);
+      
+      setTimeout(() => {
+        confetti.remove();
+      }, 4000);
+    }
+    
+    showEasterEgg();
+    
+    mascotClickCount = 0;
+  }
+}
+// 显示彩蛋窗口
+function showEasterEgg() {
+  document.getElementById('easterEggWindow').classList.remove('hide');
+  if (!playerFlags.easter) {
+    playerFlags.easter = true;
+    saveProgress();
+    checkAchievementClaim();
+  }
+}
+// VIP彩蛋链接点击（"你被骗了!"成就标志，一次性，持久化）
+function vipLinkClicked() {
+  if (!playerFlags.vipLink) {
+    playerFlags.vipLink = true;
+    playerFlags.easter = true;
+    saveProgress();
+    checkAchievementClaim();
+  }
+}
+// 隐藏彩蛋窗口
+function hideEasterEgg() {
+  document.getElementById('easterEggWindow').classList.add('hide');
+  
+  document.getElementById("navContainer").classList.remove("hide");
+  
+  showCategory(currentPageKey || firstPageKey());
+}
+// ============ 地铁8号线彩蛋：页面加载后或每次答题后10%概率显示在左侧 ============
+function maybeShowMetroEgg() {
+  const btn = document.getElementById('metroEggBtn');
+  if (!btn || !btn.classList.contains('hide')) return; // 已显示或弹窗打开时不重复触发
+  if (Math.random() < 0.1) btn.classList.remove('hide');
+}
+function metroEggClick() {
+  document.getElementById('metroEggBtn').classList.add('hide');
+  document.getElementById('metroEggWindow').classList.remove('hide');
+  if (!playerFlags.easter) {
+    playerFlags.easter = true;
+    saveProgress();
+    checkAchievementClaim();
+  }
+}
+function hideMetroEgg() {
+  document.getElementById('metroEggWindow').classList.add('hide');
+}
+// ============ VIP标题彩蛋：连续点击游戏标题5次触发 ============
+let titleClickCount = 0;
+let titleClickTimer = null;
+function titleClick() {
+  titleClickCount++;
+
+  if (titleClickTimer) clearTimeout(titleClickTimer);
+  titleClickTimer = setTimeout(() => { titleClickCount = 0; titleClickTimer = null; }, 2000);
+
+  if (titleClickCount === 5) {
+    titleClickCount = 0;
+    if (titleClickTimer) { clearTimeout(titleClickTimer); titleClickTimer = null; }
+    playSound('win');
+
+    for (let i = 0; i < 15; i++) {
+      const confetti = document.createElement('div');
+      confetti.style.position = 'fixed';
+      confetti.style.left = Math.random() * 100 + '%';
+      confetti.style.top = '100%';
+      confetti.style.fontSize = (15 + Math.random() * 20) + 'px';
+      confetti.style.pointerEvents = 'none';
+      confetti.style.zIndex = '9999';
+      confetti.style.color = '#FFD700';
+      confetti.innerText = ['👑', '🎊', '🎉', '✨', '⭐', '💎'][Math.floor(Math.random() * 6)];
+      confetti.style.animation = `confetti ${2 + Math.random() * 2}s linear forwards`;
+      document.body.appendChild(confetti);
+      setTimeout(() => { confetti.remove(); }, 4000);
+    }
+
+    showVIPEgg();
+  }
+}
+// 显示VIP彩蛋窗口
+function showVIPEgg() {
+  document.getElementById('vipEggWindow').classList.remove('hide');
+}
+// 隐藏VIP彩蛋窗口
+function hideVIPEgg() {
+  document.getElementById('vipEggWindow').classList.add('hide');
+}
+// 为庆祝效果添加动画
+const style = document.createElement('style');
+style.textContent = `
+  @keyframes confetti {
+    0% {
+      transform: translateY(0) rotate(0deg);
+      opacity: 1;
+    }
+    100% {
+      transform: translateY(-100vh) rotate(360deg);
+      opacity: 0;
+    }
+  }
+`;
+document.head.appendChild(style);
+
+document.addEventListener('keydown', function(event) {
+  if (event.key === 'Escape') {
+    // 商店购买确认弹窗打开时，ESC仅关闭确认弹窗
+    const buyWin = document.getElementById('shopBuyWindow');
+    if (buyWin && !buyWin.classList.contains('hide')) {
+      hideShopBuy();
+      return;
+    }
+    // 商店全屏弹窗打开时，ESC仅关闭商店页
+    const shopOverlay = document.getElementById('shopOverlay');
+    if (shopOverlay && !shopOverlay.classList.contains('hide')) {
+      hideShop();
+      return;
+    }
+    // 成就全屏弹窗打开时，ESC仅关闭成就页
+    const achvOverlay = document.getElementById('achievementOverlay');
+    if (achvOverlay && !achvOverlay.classList.contains('hide')) {
+      hideAchievements();
+      return;
+    }
+    document.getElementById('aboutPage').classList.add('hide');
+    document.getElementById('helpPage').classList.add('hide');
+    document.getElementById('settingsPage').classList.add('hide');
+    document.getElementById('game').classList.add('hide');
+    // 隐藏PK模式页面并停止计时
+    const pkContainer = document.getElementById('pkModeContainer');
+    if (!pkContainer.classList.contains('hide')) {
+      if (pkTimerInterval) {
+        clearInterval(pkTimerInterval);
+        pkTimerInterval = null;
+      }
+      pkContainer.classList.add('hide');
+      pkContainer.style.display = 'none';
+      document.getElementById("navContainer").classList.remove("hide");
+    }
+    
+    showCategory(firstPageKey());
+  }
+});
+
+window.addEventListener('load', async function() {
+  document.getElementById('pkModeContainer').classList.add('hide');
+  // 登录弹窗支持回车提交
+  ['usernameInput', 'passwordInput', 'totpInput'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          handleLogin();
+        }
+      });
+    }
+  });
+
+  await loadBanks();
+  initAuth();
+  maybeShowMetroEgg();
+});
+
+</script>
+</body>
+</html>
