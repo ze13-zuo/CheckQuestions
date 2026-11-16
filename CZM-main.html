@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>字谜闯关游戏V1.6-beta1</title>
+<title>字谜闯关游戏V1.6-beta2</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -1256,10 +1256,16 @@ function confirmBuy() {
   document.getElementById('shopPointsText').textContent =
     (langData?.points?.title || '积分') + '：' + playerPoints;
 }
+// 判断商品效果是否在当前题库生效：tier 为“通用”的商品全局生效，其余仅限所属题库
+function isShopEffectActive(it) {
+  if (it.tier === '通用' || it.scope === 'global') return true;
+  return !it.bankId || it.bankId === currentBankId;
+}
 // 判断是否已拥有某个一次性 UI 效果类商品（effect 如 ui-glass/ui-neon/ui-dark/ui-rainbow/ui-font）
 function hasUiEffect(effect) {
   for (const it of (allBankShopItems || [])) {
     if (it.effect !== effect) continue;
+    if (!isShopEffectActive(it)) continue;
     if (ownedShopItems.includes(String(it.id))) return true;
   }
   return false;
@@ -1283,11 +1289,12 @@ function toggleUiEffect(effect) {
   applyUiEffects();
   renderShop();
 }
-// 按效果类型取已拥有等级商品的最大等级（glint=绿闪/time=答题时间/points=积分加成）
+// 按效果类型取已拥有等级商品的最大等级（仅统计当前题库生效的商品）
 function getShopEffectLevel(effect) {
   let lv = 0;
   for (const it of (allBankShopItems || [])) {
     if (it.effect !== effect) continue;
+    if (!isShopEffectActive(it)) continue;
     const id = String(it.id);
     if (!ownedShopItems.includes(id)) continue;
     const max = Math.max(0, parseInt(it.maxLevel, 10) || 0);
@@ -1822,7 +1829,7 @@ function twofaDisable() {
   <div class="creator-info">
     <p><strong>制作者：</strong>XLNEW,小左ze13</p>
     <p><strong>开发工具：</strong>TraeCN</p>
-    <p><strong>版本：</strong>V1.6-beta1 20261110</p>
+    <p><strong>版本：</strong>V1.6-beta2 20261116</p>
     <p><strong>在Bilibili找到我们：</strong></p>
     <p><a href="https://space.bilibili.com/1813056072" target="_blank">举个厉子MC</a></p>
     <p><a href="https://space.bilibili.com/662813779" target="_blank">小左ze13</a></p>
@@ -1916,14 +1923,12 @@ function twofaDisable() {
       <button class="btn" style="padding:4px 12px;font-size:13px" onclick="playSound('click');openPasswordDialog()" id="pwdManageBtn">设置密码</button>
     </div>
     <div style="display:flex;justify-content:space-between;align-items:center">
-      <span id="twofaLabel">二步验证 (2FA)</span>
+      <span><span id="twofaLabel">二步验证 (2FA)</span><span style="color:#e53935;font-size:12px">（测试功能！）</span></span>
       <button class="btn" style="padding:4px 12px;font-size:13px" onclick="playSound('click');open2FADialog()" id="twofaManageBtn">开启2FA</button>
     </div>
   </div>
   
-  <div class="creator-info">
-    <p><strong>提示：</strong>设置会自动保存</p>
-  </div>
+  <p id="settingsNote" style="text-align:center;margin-top:30px;padding-top:20px;border-top:2px solid #e8f0ff;margin-bottom:0"><strong>提示：设置会自动保存</strong></p>
   
   <button id="returnGameBtn" class="btn" onclick="playSound('click');hideSettings()" style="margin-top:20px;width:100%">返回游戏</button>
 </div>
@@ -4073,7 +4078,7 @@ function updateUI() {
   }
   const aboutPageCreator3 = document.querySelector('#aboutPage .creator-info p:nth-child(3)');
   if (aboutPageCreator3) {
-    aboutPageCreator3.innerHTML = `<strong>${langData?.about?.version || "版本："}</strong>V1.6-beta1 20261110`;
+    aboutPageCreator3.innerHTML = `<strong>${langData?.about?.version || "版本："}</strong>V1.6-beta2 20261116`;
   }
   const aboutPageCreator4 = document.querySelector('#aboutPage .creator-info p:nth-child(4)');
   if (aboutPageCreator4) {
@@ -4182,7 +4187,7 @@ function updateUI() {
   const twofaLabel = document.getElementById('twofaLabel');
   if (twofaLabel) twofaLabel.textContent = langData?.security?.twofa || "二步验证 (2FA)";
   refreshSecurityButtons();
-  const settingsPageCreator = document.querySelector('#settingsPage .creator-info p');
+  const settingsPageCreator = document.getElementById('settingsNote');
   if (settingsPageCreator) {
     settingsPageCreator.innerHTML = `<strong>${langData?.settings?.note || "提示：设置会自动保存"}</strong>`;
   }
